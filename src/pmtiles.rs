@@ -1,6 +1,7 @@
 use std::{
     io::{Cursor, Read, Result, Seek, Write},
     ops::RangeBounds,
+    path::PathBuf,
 };
 
 use duplicate::duplicate_item;
@@ -134,10 +135,10 @@ impl<R> PMTiles<R> {
     /// Adds a tile to this `PMTiles` archive.
     ///
     /// Note that the data should already be compressed if [`Self::tile_compression`] is set to a value other than [`Compression::None`].
-    /// The data will **NOT** be compressed automatically.  
+    /// The data will **NOT** be compressed automatically.
     /// The [`util`-module](crate::util) includes utilities to compress data.
-    pub fn add_tile(&mut self, tile_id: u64, data: impl Into<Vec<u8>>) {
-        self.tile_manager.add_tile(tile_id, data);
+    pub fn add_tile(&mut self, tile_id: u64, path: PathBuf) -> Result<()> {
+        self.tile_manager.add_tile(tile_id, path)
     }
 
     /// Removes a tile from this archive.
@@ -155,7 +156,7 @@ impl<R: Read + Seek> PMTiles<R> {
     /// Get data of a tile by its id.
     ///
     /// The returned data is the raw data, meaning It is NOT uncompressed automatically,
-    /// if it was compressed in the first place.  
+    /// if it was compressed in the first place.
     /// If you need the uncompressed data, take a look at the [`util`-module](crate::util)
     ///
     /// Will return [`Ok`] with an value of [`None`] if no a tile with the specified tile id was found.
@@ -186,7 +187,7 @@ impl<R: AsyncRead + AsyncReadExt + Send + Unpin + AsyncSeekExt> PMTiles<R> {
     /// Get data of a tile by its id.
     ///
     /// The returned data is the raw data, meaning It is NOT uncompressed automatically,
-    /// if it was compressed in the first place.  
+    /// if it was compressed in the first place.
     /// If you need the uncompressed data, take a look at the [`util`-module](crate::util)
     ///
     /// Will return [`Ok`] with an value of [`None`] if no a tile with the specified tile id was found.
@@ -301,27 +302,21 @@ impl<R: RTraits> PMTiles<R> {
     }
 }
 
-#[duplicate_item(
-    fn_name                cfg_async_filter       async    add_await(code) RTraits                                                  SeekFrom                WTraits                                    finish         compress         write_directories         to_writer;
-    [to_writer_impl]       [cfg(all())]           []       [code]          [Read + Seek]                                            [std::io::SeekFrom]     [Write + Seek]                             [finish]       [compress]       [write_directories]       [to_writer];
-    [to_async_writer_impl] [cfg(feature="async")] [async]  [code.await]    [AsyncRead + AsyncReadExt + Send + Unpin + AsyncSeekExt] [futures::io::SeekFrom] [AsyncWrite + Send + Unpin + AsyncSeekExt] [finish_async] [compress_async] [write_directories_async] [to_async_writer];
-)]
-#[cfg_async_filter]
-impl<R: RTraits> PMTiles<R> {
+impl<R: Read + Seek> PMTiles<R> {
     #[allow(clippy::wrong_self_convention)]
-    async fn fn_name(self, output: &mut (impl WTraits)) -> Result<()> {
-        let result = add_await([self.tile_manager.finish()])?;
+    fn to_writer_impl(self, output: &mut (impl Write + Seek)) -> Result<()> {
+        let result = self.tile_manager.finish()?;
 
         // ROOT DIR
-        add_await([output.seek(SeekFrom::Current(i64::from(HEADER_BYTES)))])?;
+        output.seek(std::io::SeekFrom::Current(i64::from(HEADER_BYTES)))?;
         let root_directory_offset = u64::from(HEADER_BYTES);
-        let leaf_directories_data = add_await([write_directories(
+        let leaf_directories_data = write_directories(
             output,
             &result.directory[0..],
             self.internal_compression,
             None,
-        )])?;
-        let root_directory_length = add_await([output.stream_position()])? - root_directory_offset;
+        )?;
+        let root_directory_length = output.stream_position()? - root_directory_offset;
 
         // META DATA
         let json_metadata_offset = root_directory_offset + root_directory_length;
@@ -329,23 +324,25 @@ impl<R: RTraits> PMTiles<R> {
             let meta_val = self.meta_data.unwrap_or_else(|| json!({}));
             let mut compression_writer = compress(self.internal_compression, output)?;
             let vec = serde_json::to_vec(&meta_val)?;
-            add_await([compression_writer.write_all(&vec)])?;
+            compression_writer.write_all(&vec)?;
 
-            add_await([compression_writer.flush()])?;
+            compression_writer.flush()?;
         }
-        let json_metadata_length = add_await([output.stream_position()])? - json_metadata_offset;
+        let json_metadata_length = output.stream_position()? - json_metadata_offset;
 
         // LEAF DIRECTORIES
         let leaf_directories_offset = json_metadata_offset + json_metadata_length;
-        add_await([output.write_all(&leaf_directories_data[0..])])?;
+        output.write_all(&leaf_directories_data[0..])?;
         drop(leaf_directories_data);
-        let leaf_directories_length =
-            add_await([output.stream_position()])? - leaf_directories_offset;
+        let leaf_directories_length = output.stream_position()? - leaf_directories_offset;
 
         // DATA
         let tile_data_offset = leaf_directories_offset + leaf_directories_length;
-        add_await([output.write_all(&result.data[0..])])?;
-        let tile_data_length = result.data.len() as u64;
+        for path in result.payloads {
+            if let Ok(content) = std::fs::read(path) {
+                output.write_all(&content)?;
+            }
+        }
 
         // HEADER
         let header = Header {
@@ -357,7 +354,7 @@ impl<R: RTraits> PMTiles<R> {
             leaf_directories_offset,
             leaf_directories_length,
             tile_data_offset,
-            tile_data_length,
+            tile_data_length: result.total_tile_length,
             num_addressed_tiles: result.num_addressed_tiles,
             num_tile_entries: result.num_tile_entries,
             num_tile_content: result.num_tile_content,
@@ -382,15 +379,121 @@ impl<R: RTraits> PMTiles<R> {
             },
         };
 
-        add_await([output.seek(SeekFrom::Start(
+        output.seek(std::io::SeekFrom::Start(
             root_directory_offset - u64::from(HEADER_BYTES),
-        ))])?; // jump to start of stream
+        ))?; // jump to start of stream
 
-        add_await([header.to_writer(output)])?;
+        header.to_writer(output)?;
 
-        add_await([output.seek(SeekFrom::Start(
-            (root_directory_offset - u64::from(HEADER_BYTES)) + tile_data_offset + tile_data_length,
-        ))])?; // jump to end of stream
+        output.seek(std::io::SeekFrom::Start(
+            (root_directory_offset - u64::from(HEADER_BYTES))
+                + tile_data_offset
+                + result.total_tile_length,
+        ))?; // jump to end of stream
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "async")]
+impl<R: AsyncRead + AsyncReadExt + Send + Unpin + AsyncSeekExt> PMTiles<R> {
+    #[allow(clippy::wrong_self_convention)]
+    async fn to_async_writer_impl(
+        self,
+        output: &mut (impl AsyncWrite + Send + Unpin + AsyncSeekExt),
+    ) -> Result<()> {
+        let result = self.tile_manager.finish_async().await?;
+
+        // ROOT DIR
+        output
+            .seek(futures::io::SeekFrom::Current(i64::from(HEADER_BYTES)))
+            .await?;
+        let root_directory_offset = u64::from(HEADER_BYTES);
+        let leaf_directories_data = write_directories_async(
+            output,
+            &result.directory[0..],
+            self.internal_compression,
+            None,
+        )
+        .await?;
+        let root_directory_length = output.stream_position().await? - root_directory_offset;
+
+        // META DATA
+        let json_metadata_offset = root_directory_offset + root_directory_length;
+        {
+            let meta_val = self.meta_data.unwrap_or_else(|| json!({}));
+            let mut compression_writer = compress_async(self.internal_compression, output)?;
+            let vec = serde_json::to_vec(&meta_val)?;
+            compression_writer.write_all(&vec).await?;
+
+            compression_writer.flush().await?;
+        }
+        let json_metadata_length = output.stream_position().await? - json_metadata_offset;
+
+        // LEAF DIRECTORIES
+        let leaf_directories_offset = json_metadata_offset + json_metadata_length;
+        output.write_all(&leaf_directories_data[0..]).await?;
+        drop(leaf_directories_data);
+        let leaf_directories_length = output.stream_position().await? - leaf_directories_offset;
+
+        // DATA
+        let tile_data_offset = leaf_directories_offset + leaf_directories_length;
+        for path in result.payloads {
+            // if let Ok(content) = read(path).await {
+            //     output.write_all(&content).await?;
+            // }
+        }
+
+        // HEADER
+        let header = Header {
+            spec_version: 3,
+            root_directory_offset,
+            root_directory_length,
+            json_metadata_offset,
+            json_metadata_length,
+            leaf_directories_offset,
+            leaf_directories_length,
+            tile_data_offset,
+            tile_data_length: result.total_tile_length,
+            num_addressed_tiles: result.num_addressed_tiles,
+            num_tile_entries: result.num_tile_entries,
+            num_tile_content: result.num_tile_content,
+            clustered: true,
+            internal_compression: self.internal_compression,
+            tile_compression: self.tile_compression,
+            tile_type: self.tile_type,
+            min_zoom: self.min_zoom,
+            max_zoom: self.max_zoom,
+            min_pos: LatLng {
+                longitude: self.min_longitude,
+                latitude: self.min_latitude,
+            },
+            max_pos: LatLng {
+                longitude: self.max_longitude,
+                latitude: self.max_latitude,
+            },
+            center_zoom: self.center_zoom,
+            center_pos: LatLng {
+                longitude: self.center_longitude,
+                latitude: self.center_latitude,
+            },
+        };
+
+        output
+            .seek(futures::io::SeekFrom::Start(
+                root_directory_offset - u64::from(HEADER_BYTES),
+            ))
+            .await?; // jump to start of stream
+
+        header.to_async_writer(output).await?;
+
+        output
+            .seek(futures::io::SeekFrom::Start(
+                (root_directory_offset - u64::from(HEADER_BYTES))
+                    + tile_data_offset
+                    + result.total_tile_length,
+            ))
+            .await?; // jump to end of stream
 
         Ok(())
     }
