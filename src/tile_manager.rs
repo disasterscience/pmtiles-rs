@@ -5,7 +5,7 @@ use std::{
     collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
     io::{Cursor, Error, ErrorKind, Read, Result, Seek},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use ahash::{AHasher, RandomState};
@@ -19,26 +19,55 @@ enum TileManagerTile {
 }
 
 pub struct FinishResult {
-    // pub data: Vec<u8>,
     pub num_addressed_tiles: u64,
     pub num_tile_entries: u64,
     pub num_tile_content: u64,
     pub directory: Directory,
-    pub payloads: Vec<PathBuf>,
+    pub tiles: Vec<TileData>,
     pub total_tile_length: u64,
 }
 
-// #[derive(Debug)]
-// enum TileData {
-//     InMemory(Vec<u8>),
-//     OnDisk(PathBuf),
-// }
+#[derive(Debug, Clone)]
+pub enum TileData {
+    InMemory(Vec<u8>),
+    OnDisk(PathBuf),
+}
+
+impl TileData {
+    // fn len(&self) -> Result<usize> {
+    //     match self {
+    //         TileData::InMemory(data) => Ok(data.len()),
+    //         TileData::OnDisk(path) => {
+    //             let metadata = std::fs::metadata(path)?;
+    //             Ok(metadata.len() as usize)
+    //         }
+    //     }
+    // }
+
+    pub fn read(&self) -> Result<Vec<u8>> {
+        match self {
+            Self::InMemory(data) => Ok(data.clone()),
+            Self::OnDisk(path) => std::fs::read(path),
+        }
+    }
+}
+
+impl From<Vec<u8>> for TileData {
+    fn from(val: Vec<u8>) -> Self {
+        TileData::InMemory(val)
+    }
+}
+
+impl From<PathBuf> for TileData {
+    fn from(val: PathBuf) -> Self {
+        TileData::OnDisk(val)
+    }
+}
 
 #[derive(Debug)]
 pub struct TileManager<R> {
     /// hash of tile -> bytes of tile
-    // data_by_hash: HashMap<u64, Vec<u8>>,
-    data_by_hash: HashMap<u64, PathBuf>,
+    data_by_hash: HashMap<u64, TileData>,
 
     /// tile_id -> hash of tile
     tile_by_id: HashMap<u64, TileManagerTile>,
@@ -66,8 +95,8 @@ impl<R> TileManager<R> {
     }
 
     /// Add tile to writer
-    pub fn add_tile(&mut self, tile_id: u64, path: PathBuf) -> Result<()> {
-        let vec: Vec<u8> = std::fs::read(&path)?;
+    pub fn add_tile(&mut self, tile_id: u64, tile_data: TileData) -> Result<()> {
+        let vec: Vec<u8> = tile_data.read()?;
 
         // remove tile just to make sure that there
         // are no unreachable tiles
@@ -77,7 +106,7 @@ impl<R> TileManager<R> {
 
         self.tile_by_id.insert(tile_id, TileManagerTile::Hash(hash));
 
-        self.data_by_hash.insert(hash, path);
+        self.data_by_hash.insert(hash, tile_data);
 
         self.ids_by_hash.entry(hash).or_default().insert(tile_id);
 
@@ -153,13 +182,13 @@ impl<R> TileManager<R> {
 impl<R: RTraits> TileManager<R> {
     async fn get_tile_content(
         reader: &mut Option<R>,
-        data_by_hash: &HashMap<u64, PathBuf>,
+        data_by_hash: &HashMap<u64, TileData>,
         tile: &TileManagerTile,
     ) -> Result<Option<Vec<u8>>> {
         match tile {
             TileManagerTile::Hash(hash) => {
                 if let Some(path) = data_by_hash.get(hash) {
-                    Ok(Some(std::fs::read(path)?))
+                    Ok(Some(path.read()?))
                 } else {
                     return Err(Error::new(
                         ErrorKind::UnexpectedEof,
@@ -212,7 +241,7 @@ impl<R: RTraits> TileManager<R> {
         // hash => offset+length
         let mut offset_length_map = HashMap::<u64, OffsetLen, RandomState>::default();
 
-        let mut payloads = vec![];
+        let mut tiles: Vec<TileData> = vec![];
 
         for (tile_id, tile) in id_tile {
             let Some(tile_data) = add_await([Self::get_tile_content(
@@ -232,10 +261,6 @@ impl<R: RTraits> TileManager<R> {
 
             num_addressed_tiles += 1;
 
-            if let Some(payload) = self.data_by_hash.get(&hash) {
-                payloads.push(payload.clone());
-            }
-
             if let Some((offset, length)) = offset_length_map.get(&hash) {
                 Self::push_entry(&mut entries, tile_id, *offset, *length);
             } else {
@@ -251,6 +276,10 @@ impl<R: RTraits> TileManager<R> {
                 Self::push_entry(&mut entries, tile_id, offset, length);
                 offset_length_map.insert(hash, (offset, length));
             }
+
+            if let Some(payload) = self.data_by_hash.get(&hash) {
+                tiles.push(payload.clone());
+            }
         }
 
         let num_tile_entries = entries.len() as u64;
@@ -258,7 +287,7 @@ impl<R: RTraits> TileManager<R> {
         Ok(FinishResult {
             // data,
             total_tile_length: current_offset,
-            payloads,
+            tiles,
             directory: entries.into(),
             num_addressed_tiles,
             num_tile_content,

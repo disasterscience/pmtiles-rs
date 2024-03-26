@@ -11,7 +11,7 @@ use serde_json::{json, Value as JSONValue};
 
 use crate::{
     header::{LatLng, HEADER_BYTES},
-    tile_manager::TileManager,
+    tile_manager::{TileData, TileManager},
     util::{compress, decompress, read_directories, tile_id, write_directories},
     Compression, Header, TileType,
 };
@@ -137,7 +137,7 @@ impl<R> PMTiles<R> {
     /// Note that the data should already be compressed if [`Self::tile_compression`] is set to a value other than [`Compression::None`].
     /// The data will **NOT** be compressed automatically.
     /// The [`util`-module](crate::util) includes utilities to compress data.
-    pub fn add_tile(&mut self, tile_id: u64, path: PathBuf) -> Result<()> {
+    pub fn add_tile(&mut self, tile_id: u64, path: TileData) -> Result<()> {
         self.tile_manager.add_tile(tile_id, path)
     }
 
@@ -338,8 +338,8 @@ impl<R: Read + Seek> PMTiles<R> {
 
         // DATA
         let tile_data_offset = leaf_directories_offset + leaf_directories_length;
-        for path in result.payloads {
-            if let Ok(content) = std::fs::read(path) {
+        for path in result.tiles {
+            if let Ok(content) = path.read() {
                 output.write_all(&content)?;
             }
         }
@@ -438,10 +438,10 @@ impl<R: AsyncRead + AsyncReadExt + Send + Unpin + AsyncSeekExt> PMTiles<R> {
 
         // DATA
         let tile_data_offset = leaf_directories_offset + leaf_directories_length;
-        for path in result.payloads {
-            // if let Ok(content) = read(path).await {
-            //     output.write_all(&content).await?;
-            // }
+        for path in result.tiles {
+            if let Ok(content) = path.read() {
+                output.write_all(&content).await?;
+            }
         }
 
         // HEADER
