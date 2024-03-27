@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 use deku::prelude::*;
 
 /// A tile type, which is supported in `PMTiles` archives.
@@ -36,6 +38,31 @@ impl TileType {
             Self::Jpeg => Some("image/jpeg"),
             Self::WebP => Some("image/webp"),
             Self::Unknown => None,
+        }
+    }
+
+    /// Returns expected file suffix, for the given tile type.
+    pub const fn file_suffix(&self) -> &'static str {
+        match self {
+            Self::Mvt => ".mvt",
+            Self::Png => ".png",
+            Self::Jpeg => ".jpeg",
+            Self::WebP => ".webp",
+            Self::Unknown => "",
+        }
+    }
+}
+
+impl FromStr for TileType {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "mvt" => Ok(Self::Mvt),
+            "png" => Ok(Self::Png),
+            "jpeg" => Ok(Self::Jpeg),
+            "webp" => Ok(Self::WebP),
+            _ => Err(()),
         }
     }
 }
