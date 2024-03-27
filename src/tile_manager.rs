@@ -253,7 +253,7 @@ impl<R: RTraits> TileManager<R> {
 
             if let Some((offset, length)) = offset_length_map.get(&hash) {
                 Self::push_entry(&mut entries, tile_id, *offset, *length);
-            } else {
+            } else if let Some(payload) = self.data_by_hash.get(&hash) {
                 let offset = current_offset;
 
                 #[allow(clippy::cast_possible_truncation)]
@@ -265,9 +265,7 @@ impl<R: RTraits> TileManager<R> {
 
                 Self::push_entry(&mut entries, tile_id, offset, length);
                 offset_length_map.insert(hash, (offset, length));
-            }
 
-            if let Some(payload) = self.data_by_hash.get(&hash) {
                 tiles.push(payload.clone());
             }
         }
