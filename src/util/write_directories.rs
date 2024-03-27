@@ -30,10 +30,10 @@ impl Default for WriteDirsOverflowStrategy {
 }
 
 impl WriteDirsOverflowStrategy {
+    /// Retrieve the size of the leaf directories.
     pub const fn leaf_size(&self) -> usize {
         match self {
             Self::OnlyLeafPointers { start_size } => *start_size,
-            _ => 4096,
         }
     }
 }

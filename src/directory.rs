@@ -2,7 +2,7 @@ use duplicate::duplicate_item;
 use integer_encoding::{VarIntReader, VarIntWriter};
 use std::io::{Read, Result, Write};
 use std::ops::{Index, IndexMut, Range};
-use std::slice::{Iter, SliceIndex};
+use std::slice::SliceIndex;
 
 #[cfg(feature = "async")]
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -61,7 +61,8 @@ impl Entry {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(transparent))]
 pub struct Directory {
-    entries: Vec<Entry>,
+    /// Tiles contained within a directory
+    pub entries: Vec<Entry>,
 }
 
 impl Directory {
@@ -73,13 +74,6 @@ impl Directory {
     /// Returns `true` if the directory contains no entries.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
-    }
-
-    /// Returns an iterator over the directory.
-    ///
-    /// The iterator yields all entries from start to end.
-    pub fn iter(&self) -> Iter<'_, Entry> {
-        self.entries.iter()
     }
 }
 

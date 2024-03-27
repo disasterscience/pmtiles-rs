@@ -7,7 +7,7 @@ use duplicate::duplicate_item;
 #[cfg(feature = "async")]
 use futures::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use serde_json::{json, Value as JSONValue};
-use tracing::debug;
+use tracing::trace;
 
 use crate::{
     header::{LatLng, HEADER_BYTES},
@@ -333,10 +333,11 @@ impl<R: Read + Seek> PMTiles<R> {
     /// pm_tiles.to_writer(&mut file).unwrap();
     /// ```
     #[allow(clippy::wrong_self_convention)]
+    #[allow(clippy::cognitive_complexity)]
     pub fn to_writer(self, output: &mut (impl Write + Seek)) -> Result<()> {
         let result = self.tile_manager.finish()?;
 
-        debug!("Writing PMTiles archive");
+        trace!("Writing PMTiles archive");
 
         // ROOT DIR
         output.seek(std::io::SeekFrom::Current(i64::from(HEADER_BYTES)))?;
@@ -350,9 +351,10 @@ impl<R: Read + Seek> PMTiles<R> {
         )?;
         let root_directory_length = output.stream_position()? - root_directory_offset;
 
-        debug!(
+        trace!(
             "Root directory offset: {:x}, len: {}",
-            root_directory_offset, root_directory_length
+            root_directory_offset,
+            root_directory_length
         );
 
         // META DATA
@@ -367,9 +369,10 @@ impl<R: Read + Seek> PMTiles<R> {
         }
         let json_metadata_length = output.stream_position()? - json_metadata_offset;
 
-        debug!(
+        trace!(
             "Metadata offset: {:x}, len: {}",
-            json_metadata_offset, json_metadata_length
+            json_metadata_offset,
+            json_metadata_length
         );
 
         // LEAF DIRECTORIES
@@ -378,9 +381,10 @@ impl<R: Read + Seek> PMTiles<R> {
         drop(leaf_directories_data);
         let leaf_directories_length = output.stream_position()? - leaf_directories_offset;
 
-        debug!(
+        trace!(
             "Leaf directorry offset: {:x}, len: {}",
-            leaf_directories_offset, leaf_directories_length
+            leaf_directories_offset,
+            leaf_directories_length
         );
 
         // TILE DATA
@@ -393,9 +397,10 @@ impl<R: Read + Seek> PMTiles<R> {
             }
         }
 
-        debug!(
+        trace!(
             "Tile data offset: {:x}, len: {}",
-            tile_data_offset, result.total_tile_length
+            tile_data_offset,
+            result.total_tile_length
         );
 
         // HEADER
