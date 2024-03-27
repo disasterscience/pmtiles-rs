@@ -47,6 +47,7 @@ async-compression = { version = "0.3.15", optional = true, features = [
 ] }
 duplicate = "1.0.0"
 async-recursion = { version = "1.0.4", optional = true }
+tracing = "0.1.40"
 
 [dev-dependencies]
 temp-dir = "0.1"

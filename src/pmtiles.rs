@@ -7,18 +7,20 @@ use duplicate::duplicate_item;
 #[cfg(feature = "async")]
 use futures::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use serde_json::{json, Value as JSONValue};
+use tracing::debug;
 
 use crate::{
     header::{LatLng, HEADER_BYTES},
     tile_manager::{TileData, TileManager},
-    util::{compress, decompress, read_directories, tile_id, write_directories},
+    util::{
+        compress, decompress, read_directories, tile_id, write_directories,
+        write_directories_async, WriteDirsOverflowStrategy,
+    },
     Compression, Header, TileType,
 };
 
 #[cfg(feature = "async")]
-use crate::util::{
-    compress_async, decompress_async, read_directories_async, write_directories_async,
-};
+use crate::util::{compress_async, decompress_async, read_directories_async};
 
 #[derive(Debug)]
 /// A structure representing a `PMTiles` archive.
@@ -305,20 +307,53 @@ impl<R: RTraits> PMTiles<R> {
 }
 
 impl<R: Read + Seek> PMTiles<R> {
+    /// Writes the archive to a writer.
+    ///
+    /// The archive is always deduped and the directory entries clustered to produce the smallest
+    /// possible archive size.
+    ///
+    /// This takes ownership of the object so all data does not need to be copied.
+    /// This prevents large memory consumption when writing large `PMTiles` archives.
+    ///
+    /// # Arguments
+    /// * `output` - Writer to write data to
+    ///
+    /// # Errors
+    /// Will return [`Err`] if [`Self::internal_compression`] was set to [`Compression::Unknown`]
+    /// or an I/O error occurred while writing to `output`.
+    ///
+    /// # Example
+    /// Write the archive to a file.
+    /// ```rust
+    /// # use pmtiles2::{PMTiles, TileType, Compression};
+    /// # let dir = temp_dir::TempDir::new().unwrap();
+    /// # let file_path = dir.path().join("foo.pmtiles");
+    /// let pm_tiles = PMTiles::new(TileType::Png, Compression::None);
+    /// let mut file = std::fs::File::create(file_path).unwrap();
+    /// pm_tiles.to_writer(&mut file).unwrap();
+    /// ```
     #[allow(clippy::wrong_self_convention)]
-    fn to_writer_impl(self, output: &mut (impl Write + Seek)) -> Result<()> {
+    pub fn to_writer(self, output: &mut (impl Write + Seek)) -> Result<()> {
         let result = self.tile_manager.finish()?;
+
+        debug!("Writing PMTiles archive");
 
         // ROOT DIR
         output.seek(std::io::SeekFrom::Current(i64::from(HEADER_BYTES)))?;
+
         let root_directory_offset = u64::from(HEADER_BYTES);
         let leaf_directories_data = write_directories(
             output,
             &result.directory[0..],
             self.internal_compression,
-            None,
+            WriteDirsOverflowStrategy::default(),
         )?;
         let root_directory_length = output.stream_position()? - root_directory_offset;
+
+        debug!(
+            "Root directory offset: {:x}, len: {}",
+            root_directory_offset, root_directory_length
+        );
 
         // META DATA
         let json_metadata_offset = root_directory_offset + root_directory_length;
@@ -332,13 +367,23 @@ impl<R: Read + Seek> PMTiles<R> {
         }
         let json_metadata_length = output.stream_position()? - json_metadata_offset;
 
+        debug!(
+            "Metadata offset: {:x}, len: {}",
+            json_metadata_offset, json_metadata_length
+        );
+
         // LEAF DIRECTORIES
         let leaf_directories_offset = json_metadata_offset + json_metadata_length;
         output.write_all(&leaf_directories_data[0..])?;
         drop(leaf_directories_data);
         let leaf_directories_length = output.stream_position()? - leaf_directories_offset;
 
-        // DATA
+        debug!(
+            "Leaf directorry offset: {:x}, len: {}",
+            leaf_directories_offset, leaf_directories_length
+        );
+
+        // TILE DATA
         let tile_data_offset = leaf_directories_offset + leaf_directories_length;
         for path in result.tiles {
             if let Ok(content) = path.read() {
@@ -347,6 +392,11 @@ impl<R: Read + Seek> PMTiles<R> {
                 println!("unable to read tile data");
             }
         }
+
+        debug!(
+            "Tile data offset: {:x}, len: {}",
+            tile_data_offset, result.total_tile_length
+        );
 
         // HEADER
         let header = Header {
@@ -402,7 +452,7 @@ impl<R: Read + Seek> PMTiles<R> {
 #[cfg(feature = "async")]
 impl<R: AsyncRead + AsyncReadExt + Send + Unpin + AsyncSeekExt> PMTiles<R> {
     #[allow(clippy::wrong_self_convention)]
-    async fn to_async_writer_impl(
+    async fn to_writer_async(
         self,
         output: &mut (impl AsyncWrite + Send + Unpin + AsyncSeekExt),
     ) -> Result<()> {
@@ -417,7 +467,7 @@ impl<R: AsyncRead + AsyncReadExt + Send + Unpin + AsyncSeekExt> PMTiles<R> {
             output,
             &result.directory[0..],
             self.internal_compression,
-            None,
+            WriteDirsOverflowStrategy::default(),
         )
         .await?;
         let root_directory_length = output.stream_position().await? - root_directory_offset;
@@ -556,35 +606,6 @@ impl<R: Read + Seek> PMTiles<R> {
         tiles_filter_range: impl RangeBounds<u64>,
     ) -> Result<Self> {
         Self::from_reader_impl(input, tiles_filter_range)
-    }
-
-    /// Writes the archive to a writer.
-    ///
-    /// The archive is always deduped and the directory entries clustered to produce the smallest
-    /// possible archive size.
-    ///
-    /// This takes ownership of the object so all data does not need to be copied.
-    /// This prevents large memory consumption when writing large `PMTiles` archives.
-    ///
-    /// # Arguments
-    /// * `output` - Writer to write data to
-    ///
-    /// # Errors
-    /// Will return [`Err`] if [`Self::internal_compression`] was set to [`Compression::Unknown`]
-    /// or an I/O error occurred while writing to `output`.
-    ///
-    /// # Example
-    /// Write the archive to a file.
-    /// ```rust
-    /// # use pmtiles2::{PMTiles, TileType, Compression};
-    /// # let dir = temp_dir::TempDir::new().unwrap();
-    /// # let file_path = dir.path().join("foo.pmtiles");
-    /// let pm_tiles = PMTiles::new(TileType::Png, Compression::None);
-    /// let mut file = std::fs::File::create(file_path).unwrap();
-    /// pm_tiles.to_writer(&mut file).unwrap();
-    /// ```
-    pub fn to_writer(self, output: &mut (impl Write + Seek)) -> Result<()> {
-        self.to_writer_impl(output)
     }
 }
 
@@ -742,7 +763,7 @@ impl<R: AsyncRead + AsyncSeekExt + Send + Unpin> PMTiles<R> {
         self,
         output: &mut (impl AsyncWrite + AsyncSeekExt + Unpin + Send),
     ) -> Result<()> {
-        self.to_async_writer_impl(output).await
+        self.to_writer_async(output).await
     }
 }
 
