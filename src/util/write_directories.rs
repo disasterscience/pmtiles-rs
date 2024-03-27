@@ -2,6 +2,7 @@ use duplicate::duplicate_item;
 #[cfg(feature = "async")]
 use futures::{AsyncSeekExt, AsyncWrite};
 use std::io::{Cursor, Result, Seek, Write};
+use tracing::debug;
 
 use crate::{header::HEADER_BYTES, Compression, Directory, Entry};
 
@@ -18,76 +19,21 @@ pub enum WriteDirsOverflowStrategy {
     /// Will double the size of leaf directories until the root directory fits into its max size.
     OnlyLeafPointers {
         /// The start size of the leaf directories (default 4096)
-        start_size: Option<usize>,
+        start_size: usize,
     },
 }
 
 impl Default for WriteDirsOverflowStrategy {
     fn default() -> Self {
-        Self::OnlyLeafPointers { start_size: None }
+        Self::OnlyLeafPointers { start_size: 4096 }
     }
 }
 
-fn write_directories_impl(
-    output: &mut (impl Write + Seek),
-    all_entries: &[Entry],
-    compression: Compression,
-    overflow_strategy: Option<WriteDirsOverflowStrategy>,
-) -> Result<Vec<u8>> {
-    let start_pos = output.stream_position()?;
-
-    {
-        let root_directory = Directory::from(all_entries.to_vec());
-        root_directory.to_writer(output, compression)?;
-    }
-
-    let root_directory_length = output.stream_position()? - start_pos;
-
-    if root_directory_length <= u64::from(MAX_ROOT_DIR_LENGTH) {
-        return Ok(Vec::new());
-    }
-
-    match overflow_strategy.unwrap_or_default() {
-        WriteDirsOverflowStrategy::OnlyLeafPointers { start_size } => only_leaf_pointer_strategy(
-            output,
-            std::io::SeekFrom::Start(start_pos),
-            all_entries,
-            compression,
-            start_size,
-        ),
-    }
-}
-
-#[cfg(feature = "async")]
-async fn write_directories_impl_async(
-    output: &mut (impl AsyncWrite + Unpin + Send + AsyncSeekExt),
-    all_entries: &[Entry],
-    compression: Compression,
-    overflow_strategy: Option<WriteDirsOverflowStrategy>,
-) -> Result<Vec<u8>> {
-    let start_pos = output.stream_position().await?;
-
-    {
-        let root_directory = Directory::from(all_entries.to_vec());
-        root_directory.to_async_writer(output, compression).await?;
-    }
-
-    let root_directory_length = output.stream_position().await? - start_pos;
-
-    if root_directory_length <= u64::from(MAX_ROOT_DIR_LENGTH) {
-        return Ok(Vec::new());
-    }
-
-    match overflow_strategy.unwrap_or_default() {
-        WriteDirsOverflowStrategy::OnlyLeafPointers { start_size } => {
-            only_leaf_pointer_strategy_async(
-                output,
-                futures::io::SeekFrom::Start(start_pos),
-                all_entries,
-                compression,
-                start_size,
-            )
-            .await
+impl WriteDirsOverflowStrategy {
+    pub const fn leaf_size(&self) -> usize {
+        match self {
+            Self::OnlyLeafPointers { start_size } => *start_size,
+            _ => 4096,
         }
     }
 }
@@ -109,9 +55,31 @@ pub fn write_directories(
     output: &mut (impl Write + Seek),
     all_entries: &[Entry],
     compression: Compression,
-    overflow_strategy: Option<WriteDirsOverflowStrategy>,
+    overflow_strategy: WriteDirsOverflowStrategy,
 ) -> Result<Vec<u8>> {
-    write_directories_impl(output, all_entries, compression, overflow_strategy)
+    let start_pos = output.stream_position()?;
+
+    {
+        let root_directory = Directory::from(all_entries.to_vec());
+        root_directory.to_writer(output, compression)?;
+    }
+
+    let root_directory_length = output.stream_position()? - start_pos;
+
+    if root_directory_length <= u64::from(MAX_ROOT_DIR_LENGTH) {
+        debug!("Root directory fits into 16kB");
+        return Ok(Vec::new());
+    }
+
+    debug!("Root directory does not fit into 16kB, using overflow strategy");
+
+    only_leaf_pointer_strategy(
+        output,
+        std::io::SeekFrom::Start(start_pos),
+        all_entries,
+        compression,
+        overflow_strategy,
+    )
 }
 
 /// Async version of [`write_directories`](write_directories).
@@ -135,9 +103,29 @@ pub async fn write_directories_async(
     output: &mut (impl AsyncWrite + Unpin + Send + AsyncSeekExt),
     all_entries: &[Entry],
     compression: Compression,
-    overflow_strategy: Option<WriteDirsOverflowStrategy>,
+    overflow_strategy: WriteDirsOverflowStrategy,
 ) -> Result<Vec<u8>> {
-    write_directories_impl_async(output, all_entries, compression, overflow_strategy).await
+    let start_pos = output.stream_position().await?;
+
+    {
+        let root_directory = Directory::from(all_entries.to_vec());
+        root_directory.to_async_writer(output, compression).await?;
+    }
+
+    let root_directory_length = output.stream_position().await? - start_pos;
+
+    if root_directory_length <= u64::from(MAX_ROOT_DIR_LENGTH) {
+        return Ok(Vec::new());
+    }
+
+    only_leaf_pointer_strategy_async(
+        output,
+        std::io::SeekFrom::Start(start_pos),
+        all_entries,
+        compression,
+        overflow_strategy,
+    )
+    .await
 }
 
 #[duplicate_item(
@@ -151,9 +139,9 @@ async fn fn_name(
     root_dir_start: SeekFrom,
     all_entries: &[Entry],
     compression: Compression,
-    start_size: Option<usize>,
+    start_size: WriteDirsOverflowStrategy,
 ) -> Result<Vec<u8>> {
-    let mut leaf_size = start_size.unwrap_or(4096);
+    let mut leaf_size = start_size.leaf_size();
 
     loop {
         let mut root_entries = Vec::<Entry>::new();
