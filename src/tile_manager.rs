@@ -5,7 +5,7 @@ use std::{
     collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
     io::{Cursor, Error, ErrorKind, Read, Result, Seek},
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 
 use ahash::{AHasher, RandomState};
@@ -34,16 +34,6 @@ pub enum TileData {
 }
 
 impl TileData {
-    // fn len(&self) -> Result<usize> {
-    //     match self {
-    //         TileData::InMemory(data) => Ok(data.len()),
-    //         TileData::OnDisk(path) => {
-    //             let metadata = std::fs::metadata(path)?;
-    //             Ok(metadata.len() as usize)
-    //         }
-    //     }
-    // }
-
     pub fn read(&self) -> Result<Vec<u8>> {
         match self {
             Self::InMemory(data) => Ok(data.clone()),
@@ -54,13 +44,13 @@ impl TileData {
 
 impl From<Vec<u8>> for TileData {
     fn from(val: Vec<u8>) -> Self {
-        TileData::InMemory(val)
+        Self::InMemory(val)
     }
 }
 
 impl From<PathBuf> for TileData {
     fn from(val: PathBuf) -> Self {
-        TileData::OnDisk(val)
+        Self::OnDisk(val)
     }
 }
 
@@ -190,10 +180,10 @@ impl<R: RTraits> TileManager<R> {
                 if let Some(path) = data_by_hash.get(hash) {
                     Ok(Some(path.read()?))
                 } else {
-                    return Err(Error::new(
+                    Err(Error::new(
                         ErrorKind::UnexpectedEof,
                         "Tried to read from non-existent data",
-                    ));
+                    ))
                 }
             }
             TileManagerTile::OffsetLength(offset, length) => match reader {
@@ -270,7 +260,7 @@ impl<R: RTraits> TileManager<R> {
                 let length = tile_data.len() as u32;
 
                 // data.append(&mut tile_data);
-                current_offset += length as u64;
+                current_offset += u64::from(length);
                 num_tile_content += 1;
 
                 Self::push_entry(&mut entries, tile_id, offset, length);
@@ -340,6 +330,7 @@ impl Default for TileManager<Cursor<&[u8]>> {
 //         assert_eq!(manager.data_by_hash.len(), 1);
 
 //         manager.add_tile(42, vec![4, 2, 1, 3, 3, 7]);
+
 //         assert_eq!(manager.data_by_hash.len(), 2);
 //     }
 

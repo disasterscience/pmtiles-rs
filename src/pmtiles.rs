@@ -1,7 +1,6 @@
 use std::{
     io::{Cursor, Read, Result, Seek, Write},
     ops::RangeBounds,
-    path::PathBuf,
 };
 
 use duplicate::duplicate_item;
@@ -137,6 +136,9 @@ impl<R> PMTiles<R> {
     /// Note that the data should already be compressed if [`Self::tile_compression`] is set to a value other than [`Compression::None`].
     /// The data will **NOT** be compressed automatically.
     /// The [`util`-module](crate::util) includes utilities to compress data.
+    ///
+    /// # Errors
+    /// Can error if the read failed or the tile data was not compressed.
     pub fn add_tile(&mut self, tile_id: u64, path: TileData) -> Result<()> {
         self.tile_manager.add_tile(tile_id, path)
     }
@@ -341,6 +343,8 @@ impl<R: Read + Seek> PMTiles<R> {
         for path in result.tiles {
             if let Ok(content) = path.read() {
                 output.write_all(&content)?;
+            } else {
+                println!("unable to read tile data");
             }
         }
 
