@@ -1,146 +1,173 @@
-use duplicate::duplicate_item;
-#[cfg(feature = "async")]
-use futures::{AsyncRead, AsyncReadExt, AsyncSeekExt};
+use crate::{error::PmTilesError, util::tile_id, Directory, Entry};
+use anyhow::Result;
 use std::{
     collections::{HashMap, HashSet},
-    hash::{Hash, Hasher},
-    io::{Cursor, Error, ErrorKind, Read, Result, Seek},
     path::PathBuf,
 };
 
-use ahash::{AHasher, RandomState};
-
-use crate::{Directory, Entry};
-
-#[derive(Debug)]
-enum TileManagerTile {
-    Hash(u64),
-    OffsetLength(u64, u32),
+#[derive(Debug, Clone)]
+pub struct Tile {
+    pub backend: TileBackend,
+    #[allow(clippy::struct_field_names)]
+    pub tile_id: u64,
+    pub hash: u64,
+    pub len: u32,
 }
 
-pub struct FinishResult {
+pub struct FinalisedTiles {
     pub num_addressed_tiles: u64,
     pub num_tile_entries: u64,
     pub num_tile_content: u64,
     pub directory: Directory,
-    pub tiles: Vec<TileData>,
+    pub tiles: Vec<Tile>,
     pub total_tile_length: u64,
 }
 
 #[derive(Debug, Clone)]
-pub enum TileData {
+pub enum TileBackend {
     InMemory(Vec<u8>),
     OnDisk(PathBuf),
 }
 
-impl TileData {
-    pub fn read(&self) -> Result<Vec<u8>> {
-        match self {
-            Self::InMemory(data) => Ok(data.clone()),
-            Self::OnDisk(path) => std::fs::read(path),
+impl Tile {
+    pub fn new(tile_id: u64, backend: TileBackend) -> Result<Self> {
+        Ok(Self {
+            hash: backend.calculate_hash()?,
+            len: backend.len()?,
+            backend,
+            tile_id,
+        })
+    }
+
+    pub async fn read_payload(&self) -> Result<Vec<u8>> {
+        match &self.backend {
+            TileBackend::InMemory(payload) => Ok(payload.clone()),
+            TileBackend::OnDisk(path) => {
+                let data = tokio::fs::read(path).await?;
+                Ok(data)
+            }
         }
     }
 }
 
-impl From<Vec<u8>> for TileData {
+impl TileBackend {
+    /// Calculate a hash from either the vec of bytes or the file at the path
+    pub fn calculate_hash(&self) -> Result<u64> {
+        match self {
+            Self::InMemory(data) => {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(data);
+                let finalised_bytes = hasher.finalize();
+                let bytes = finalised_bytes.as_bytes();
+
+                // Take the first 8 bytes from the hash and convert them to a u64
+                Ok(u64::from_le_bytes(bytes[0..8].try_into()?))
+            }
+
+            // The hash is calculated using the BLAKE3 algorithm (multi-threaded, fast, secure hash function
+            Self::OnDisk(path) => {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update_mmap_rayon(path)?;
+
+                let finalised_bytes = hasher.finalize();
+                let bytes = finalised_bytes.as_bytes();
+
+                // Take the first 8 bytes from the hash and convert them to a u64
+                Ok(u64::from_le_bytes(bytes[0..8].try_into()?))
+            }
+        }
+    }
+
+    pub fn len(&self) -> Result<u32> {
+        match self {
+            Self::InMemory(data) => Ok(data.len() as u32),
+            Self::OnDisk(path) => {
+                let metadata = std::fs::metadata(path)?;
+                Ok(metadata.len() as u32)
+            }
+        }
+    }
+}
+
+impl From<Vec<u8>> for TileBackend {
     fn from(val: Vec<u8>) -> Self {
         Self::InMemory(val)
     }
 }
 
-impl From<PathBuf> for TileData {
+impl From<PathBuf> for TileBackend {
     fn from(val: PathBuf) -> Self {
         Self::OnDisk(val)
     }
 }
 
-#[derive(Debug)]
-pub struct TileManager<R> {
-    /// hash of tile -> bytes of tile
-    data_by_hash: HashMap<u64, TileData>,
+#[derive(Debug, Default)]
+pub struct TileManager {
+    /// Lookup by hash, and retrieve tile
+    hash_to_tile: HashMap<u64, Tile>,
 
-    /// tile_id -> hash of tile
-    tile_by_id: HashMap<u64, TileManagerTile>,
+    /// Lookup by tile ID, retrive tile_id and get hash
+    tile_id_to_hash: HashMap<u64, u64>,
 
-    /// hash of tile -> ids with this hash
-    ids_by_hash: HashMap<u64, HashSet<u64>, RandomState>,
-
-    reader: Option<R>,
+    /// Lookup by hash, and resolve to all all tile IDs
+    hash_to_tile_ids: HashMap<u64, HashSet<u64>>,
 }
 
-impl<R> TileManager<R> {
-    pub fn new(reader: Option<R>) -> Self {
-        Self {
-            data_by_hash: HashMap::default(),
-            tile_by_id: HashMap::default(),
-            ids_by_hash: HashMap::default(),
-            reader,
-        }
-    }
-
-    fn calculate_hash(value: &impl Hash) -> u64 {
-        let mut hasher = AHasher::default();
-        value.hash(&mut hasher);
-        hasher.finish()
-    }
-
-    /// Add tile to writer
-    pub fn add_tile(&mut self, tile_id: u64, tile_data: TileData) -> Result<()> {
-        let vec: Vec<u8> = tile_data.read()?;
-
-        // remove tile just to make sure that there
-        // are no unreachable tiles
+impl TileManager {
+    /// Adds a tile to this `PMTiles` archive.
+    ///
+    /// Note that the data should already be compressed if [`Self::tile_compression`] is set to a value other than [`Compression::None`].
+    /// The data will **NOT** be compressed automatically.
+    /// The [`util`-module](crate::util) includes utilities to compress data.
+    ///
+    /// # Errors
+    /// Can error if the read failed or the tile data was not compressed.
+    pub fn add_tile(&mut self, tile_id: u64, tile_data: impl Into<TileBackend>) -> Result<()> {
+        // Ensure the tile doesn't already exist
         self.remove_tile(tile_id);
 
-        let hash = Self::calculate_hash(&vec);
+        // Create a tile
+        let tile = Tile::new(tile_id, tile_data.into())?;
 
-        self.tile_by_id.insert(tile_id, TileManagerTile::Hash(hash));
+        // Allow the tile to be found by its ID
+        self.tile_id_to_hash.insert(tile_id, tile.hash);
 
-        self.data_by_hash.insert(hash, tile_data);
+        self.hash_to_tile_ids
+            .entry(tile.hash)
+            .or_default()
+            .insert(tile_id);
 
-        self.ids_by_hash.entry(hash).or_default().insert(tile_id);
+        // Allow the tile to be found by its hash
+        self.hash_to_tile.insert(tile.hash, tile);
 
         Ok(())
     }
 
-    pub(crate) fn add_offset_tile(&mut self, tile_id: u64, offset: u64, length: u32) {
-        self.tile_by_id
-            .insert(tile_id, TileManagerTile::OffsetLength(offset, length));
-    }
+    /// Removes a tile from this archive.
+    pub fn remove_tile(&mut self, tile_id: u64) {
+        if let Some(hash) = self.tile_id_to_hash.remove(&tile_id) {
+            // find set which includes all ids which have this hash
+            let ids_with_hash = self.hash_to_tile_ids.entry(hash).or_default();
 
-    /// Remove tile from writer
-    pub fn remove_tile(&mut self, tile_id: u64) -> bool {
-        match self.tile_by_id.remove(&tile_id) {
-            None => false, // tile was not found
-            Some(tile) => {
-                let TileManagerTile::Hash(hash) = tile else {
-                    return true;
-                };
+            // remove current id from set
+            ids_with_hash.remove(&tile_id);
 
-                // find set which includes all ids which have this hash
-                let ids_with_hash = self.ids_by_hash.entry(hash).or_default();
-
-                // remove current id from set
-                ids_with_hash.remove(&tile_id);
-
-                // delete data for this hash, if there are
-                // no other ids that reference this hash
-                if ids_with_hash.is_empty() {
-                    self.data_by_hash.remove(&hash);
-                    self.ids_by_hash.remove(&hash);
-                }
-
-                true
+            // delete data for this hash, if there are
+            // no other ids that reference this hash
+            if ids_with_hash.is_empty() {
+                self.hash_to_tile.remove(&hash);
+                self.hash_to_tile_ids.remove(&hash);
             }
         }
     }
 
+    /// Get vector of all tile ids in this `PMTiles` archive.
     pub fn get_tile_ids(&self) -> Vec<&u64> {
-        self.tile_by_id.keys().collect()
+        self.tile_id_to_hash.keys().collect()
     }
 
     pub fn num_addressed_tiles(&self) -> usize {
-        self.tile_by_id.len()
+        self.tile_id_to_hash.len()
     }
 
     fn push_entry(entries: &mut Vec<Entry>, tile_id: u64, offset: u64, length: u32) {
@@ -161,119 +188,101 @@ impl<R> TileManager<R> {
             run_length: 1,
         });
     }
-}
 
-#[duplicate_item(
-    async    add_await(code) cfg_async_filter       RTraits                                                  SeekFrom                get_tile_content         get_tile         finish;
-    []       [code]          [cfg(all())]           [Read + Seek]                                            [std::io::SeekFrom]     [get_tile_content]       [get_tile]       [finish];
-    [async]  [code.await]    [cfg(feature="async")] [AsyncRead + AsyncReadExt + Send + Unpin + AsyncSeekExt] [futures::io::SeekFrom] [get_tile_content_async] [get_tile_async] [finish_async];
-)]
-#[cfg_async_filter]
-impl<R: RTraits> TileManager<R> {
-    async fn get_tile_content(
-        reader: &mut Option<R>,
-        data_by_hash: &HashMap<u64, TileData>,
-        tile: &TileManagerTile,
-    ) -> Result<Option<Vec<u8>>> {
-        match tile {
-            TileManagerTile::Hash(hash) => {
-                if let Some(path) = data_by_hash.get(hash) {
-                    Ok(Some(path.read()?))
-                } else {
-                    Err(Error::new(
-                        ErrorKind::UnexpectedEof,
-                        "Tried to read from non-existent data",
-                    ))
-                }
-            }
-            TileManagerTile::OffsetLength(offset, length) => match reader {
-                Some(r) => {
-                    add_await([r.seek(SeekFrom::Start(*offset))])?;
-                    let mut buf = vec![0; *length as usize];
-                    add_await([r.read_exact(&mut buf)])?;
-                    Ok(Some(buf))
-                }
-                None => Err(Error::new(
-                    ErrorKind::UnexpectedEof,
-                    "Tried to read from non-existent reader",
-                )),
-            },
-        }
+    // async fn get_tile_content(
+    //     data_by_hash: &HashMap<u64, TileBackend>,
+    //     tile: &TileManagerTile,
+    // ) -> Result<Option<Vec<u8>>> {
+    //     match tile {
+    //         TileManagerTile::Hash(hash) => {
+    //             if let Some(tile) = data_by_hash.get(hash) {
+    //                 Ok(Some(tile.read().await?))
+    //             } else {
+    //                 Ok(None)
+    //             }
+    //         }
+    //     }
+    // }
+
+    /// Get data of a tile by its id.
+    ///
+    /// The returned data is the raw data, meaning It is NOT uncompressed automatically,
+    /// if it was compressed in the first place.
+    /// If you need the uncompressed data, take a look at the [`util`-module](crate::util)
+    ///
+    /// Will return [`Ok`] with an value of [`None`] if no a tile with the specified tile id was found.
+    ///
+    /// # Errors
+    /// Will return [`Err`] if the tile data was not read into memory yet and there was an error while
+    /// attempting to read it.
+    ///
+    pub fn get_tile_by_id(&self, tile_id: u64) -> Option<&Tile> {
+        let hash = self.tile_id_to_hash.get(&tile_id)?;
+        let tile = self.hash_to_tile.get(hash)?;
+        Some(tile)
     }
 
-    pub async fn get_tile(&mut self, tile_id: u64) -> Result<Option<Vec<u8>>> {
-        match self.tile_by_id.get(&tile_id) {
-            None => Ok(None),
-            Some(tile) => add_await([Self::get_tile_content(
-                &mut self.reader,
-                &self.data_by_hash,
-                tile,
-            )]),
-        }
+    pub fn get_tile_by_hash(&self, hash: u64) -> Option<&Tile> {
+        self.hash_to_tile.get(&hash)
     }
 
-    pub async fn finish(mut self) -> Result<FinishResult> {
+    /// Returns the data of the tile with the specified coordinates.
+    ///
+    /// See [`get_tile_by_id`](Self::get_tile_by_id) for further details on the return type.
+    ///
+    /// # Errors
+    /// See [`get_tile_by_id`](Self::get_tile_by_id) for details on possible errors.
+    pub fn get_tile_xyz(&mut self, x: u64, y: u64, z: u8) -> Option<&Tile> {
+        self.get_tile_by_id(tile_id(z, x, y))
+    }
+
+    pub fn build(self) -> Result<FinalisedTiles> {
         type OffsetLen = (u64, u32);
 
-        let mut id_tile = self
-            .tile_by_id
-            .into_iter()
-            .collect::<Vec<(u64, TileManagerTile)>>();
-        id_tile.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut tiles_sorted_by_id = self.get_tile_ids();
+        tiles_sorted_by_id.sort();
 
         let mut entries = Vec::<Entry>::new();
-        // let mut data = Vec::<u8>::new();
         let mut current_offset: u64 = 0;
 
         let mut num_addressed_tiles: u64 = 0;
         let mut num_tile_content: u64 = 0;
 
         // hash => offset+length
-        let mut offset_length_map = HashMap::<u64, OffsetLen, RandomState>::default();
+        let mut offset_length_map = HashMap::<u64, OffsetLen>::default();
 
-        let mut tiles: Vec<TileData> = vec![];
+        let mut tiles: Vec<Tile> = vec![];
 
-        for (tile_id, tile) in id_tile {
-            let Some(tile_data) = add_await([Self::get_tile_content(
-                &mut self.reader,
-                &self.data_by_hash,
-                &tile,
-            )])?
-            else {
-                continue;
-            };
+        for tile_id in tiles_sorted_by_id {
+            let tile = self
+                .get_tile_by_id(*tile_id)
+                .ok_or(PmTilesError::MissingTileFollowingLookup)?;
 
-            let hash = if let TileManagerTile::Hash(h) = tile {
-                h
-            } else {
-                Self::calculate_hash(&tile_data)
-            };
+            // trace!("tile_id: {:?}, tile: {:?}", tile_id, tile);
 
             num_addressed_tiles += 1;
 
-            if let Some((offset, length)) = offset_length_map.get(&hash) {
-                Self::push_entry(&mut entries, tile_id, *offset, *length);
-            } else if let Some(payload) = self.data_by_hash.get(&hash) {
+            if let Some((offset, length)) = offset_length_map.get(&tile.hash) {
+                Self::push_entry(&mut entries, *tile_id, *offset, *length);
+            } else {
                 let offset = current_offset;
 
                 #[allow(clippy::cast_possible_truncation)]
-                let length = tile_data.len() as u32;
+                let length = tile.len;
 
-                // data.append(&mut tile_data);
                 current_offset += u64::from(length);
                 num_tile_content += 1;
 
-                Self::push_entry(&mut entries, tile_id, offset, length);
-                offset_length_map.insert(hash, (offset, length));
+                Self::push_entry(&mut entries, *tile_id, offset, length.try_into()?);
+                offset_length_map.insert(tile.hash, (offset, length.try_into()?));
 
-                tiles.push(payload.clone());
+                tiles.push(tile.clone());
             }
         }
 
         let num_tile_entries = entries.len() as u64;
 
-        Ok(FinishResult {
-            // data,
+        Ok(FinalisedTiles {
             total_tile_length: current_offset,
             tiles,
             directory: entries.into(),
@@ -281,12 +290,6 @@ impl<R: RTraits> TileManager<R> {
             num_tile_content,
             num_tile_entries,
         })
-    }
-}
-
-impl Default for TileManager<Cursor<&[u8]>> {
-    fn default() -> Self {
-        Self::new(None)
     }
 }
 

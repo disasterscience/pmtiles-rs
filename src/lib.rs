@@ -19,7 +19,7 @@
 //!
 //! fn main () -> std::io::Result<()> {
 //!     let file_path = "./test/stamen_toner(raster)CC-BY+ODbL_z3.pmtiles";
-//!     
+//!
 //!     let mut file = File::open(file_path)?; // file implements std::io::Read
 //!     let pm_tiles = PMTiles::from_reader(file)?;
 //!
@@ -36,7 +36,7 @@
 //!     // create temp directory
 //!     let dir = temp_dir::TempDir::new()?;
 //!     let file_path = dir.path().join("foo.pmtiles");
-//!     
+//!
 //!     let pm_tiles = PMTiles::new(TileType::Png, Compression::None);
 //!
 //!     // TODO: Add tiles to pm_tiles
@@ -81,3 +81,6 @@ pub mod util;
 pub use self::pmtiles::PMTiles;
 pub use directory::{Directory, Entry};
 pub use header::{Compression, Header, TileType};
+
+/// Errors for the module
+pub mod error;

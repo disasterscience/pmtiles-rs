@@ -1,6 +1,4 @@
 pub use compression::*;
-#[cfg(feature = "async")]
-use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub use lat_lng::*;
 pub use tile_type::*;
 
@@ -8,9 +6,9 @@ mod compression;
 mod lat_lng;
 mod tile_type;
 
-use deku::bitvec::{BitVec, BitView};
+use deku::bitvec::BitView;
 use deku::prelude::*;
-use std::io::{Read, Write};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const HEADER_BYTES: u8 = 127;
 
@@ -111,44 +109,6 @@ impl Header {
         self.tile_compression.http_content_encoding()
     }
 
-    /// Reads a header from a [`std::io::Read`] and returns it.
-    ///
-    /// # Arguments
-    /// * `input` - Reader
-    ///
-    /// # Errors
-    /// Will return [`Err`] an I/O error occurred while reading from `input`.
-    ///
-    pub fn from_reader(input: &mut impl Read) -> std::io::Result<Self> {
-        let mut buf = [0; HEADER_BYTES as usize];
-        input.read_exact(&mut buf)?;
-
-        let (_, header) = Self::read(buf.to_vec().view_bits(), ())?;
-
-        Ok(header)
-    }
-
-    /// Reads a header from a anything that can be turned into a byte slice (e.g. [`Vec<u8>`]).
-    ///
-    /// # Arguments
-    /// * `bytes` - Input bytes
-    ///
-    /// # Errors
-    /// Will return [`Err`] an I/O error occurred while reading from `input`.
-    ///
-    /// # Example
-    /// ```rust
-    /// # use pmtiles2::{Header};
-    /// let bytes = include_bytes!("../../test/stamen_toner(raster)CC-BY+ODbL_z3.pmtiles");
-    /// let header = Header::from_bytes(bytes).unwrap();
-    /// ```
-    ///
-    pub fn from_bytes(bytes: impl AsRef<[u8]>) -> std::io::Result<Self> {
-        let mut reader = std::io::Cursor::new(bytes);
-
-        Self::from_reader(&mut reader)
-    }
-
     /// Async version of [`from_reader`](Self::from_reader).
     ///
     /// Reads a header from a [`futures::io::AsyncRead`](https://docs.rs/futures/latest/futures/io/trait.AsyncRead.html) and returns it.
@@ -159,7 +119,6 @@ impl Header {
     /// # Errors
     /// Will return [`Err`] an I/O error occurred while reading from `input`.
     ///
-    #[cfg(feature = "async")]
     pub async fn from_async_reader(
         input: &mut (impl AsyncRead + Unpin + Send),
     ) -> std::io::Result<Self> {
@@ -172,22 +131,6 @@ impl Header {
         Ok(header)
     }
 
-    /// Writes the header to a [`std::io::Write`].
-    ///
-    /// # Arguments
-    /// * `output` - Writer to write header to
-    ///
-    /// # Errors
-    /// Will return [`Err`] if an I/O error occurred while writing to `output`.
-    ///
-    pub fn to_writer(&self, output: &mut impl Write) -> std::io::Result<()> {
-        let mut bit_vec = BitVec::with_capacity(8 * HEADER_BYTES as usize);
-        self.write(&mut bit_vec, ())?;
-        output.write_all(bit_vec.as_raw_slice())?;
-
-        Ok(())
-    }
-
     /// Async version of [`to_writer`](Self::to_writer).
     ///
     /// Writes the header to a [`futures::io::AsyncWrite`](https://docs.rs/futures/latest/futures/io/trait.AsyncWrite.html).
@@ -198,7 +141,6 @@ impl Header {
     /// # Errors
     /// Will return [`Err`] if an I/O error occurred while writing to `output`.
     ///
-    #[cfg(feature = "async")]
     pub async fn to_async_writer(
         &self,
         output: &mut (impl AsyncWrite + Unpin + Send),

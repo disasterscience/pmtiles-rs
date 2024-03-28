@@ -1,8 +1,7 @@
-use duplicate::duplicate_item;
-#[cfg(feature = "async")]
-use futures::{AsyncSeekExt, AsyncWrite};
-use std::io::{Cursor, Result, Seek, Write};
-use tracing::debug;
+use std::io::{Cursor, SeekFrom};
+
+use anyhow::Result;
+use tokio::io::{AsyncSeekExt, AsyncWrite};
 
 use crate::{header::HEADER_BYTES, Compression, Directory, Entry};
 
@@ -38,50 +37,6 @@ impl WriteDirsOverflowStrategy {
     }
 }
 
-/// Writes root directory to a writer and return bytes of leaf directory section.
-///
-/// # Arguments
-/// * `output` - Writer to write root directory to
-/// * `all_entries` - All tile entries
-/// * `compression` - Compression of directories
-/// * `overflow_strategy` - Strategy to use, when root directory does not fit in the first 16kB.
-///                         If [`None`] is passed, the best strategy is chosen automatically.
-///
-/// # Errors
-/// Will return [`Err`] if `compression` is set to [`Compression::Unknown`] or an I/O error
-/// occurred while writing to `output`.
-///
-pub fn write_directories(
-    output: &mut (impl Write + Seek),
-    all_entries: &[Entry],
-    compression: Compression,
-    overflow_strategy: WriteDirsOverflowStrategy,
-) -> Result<Vec<u8>> {
-    let start_pos = output.stream_position()?;
-
-    {
-        let root_directory = Directory::from(all_entries.to_vec());
-        root_directory.to_writer(output, compression)?;
-    }
-
-    let root_directory_length = output.stream_position()? - start_pos;
-
-    if root_directory_length <= u64::from(MAX_ROOT_DIR_LENGTH) {
-        debug!("Root directory fits into 16kB");
-        return Ok(Vec::new());
-    }
-
-    debug!("Root directory does not fit into 16kB, using overflow strategy");
-
-    only_leaf_pointer_strategy(
-        output,
-        std::io::SeekFrom::Start(start_pos),
-        all_entries,
-        compression,
-        overflow_strategy,
-    )
-}
-
 /// Async version of [`write_directories`](write_directories).
 ///
 /// Writes root directory to a writer and return bytes of leaf directory section.
@@ -98,7 +53,6 @@ pub fn write_directories(
 /// occurred while writing to `output`.
 ///
 #[allow(clippy::module_name_repetitions)]
-#[cfg(feature = "async")]
 pub async fn write_directories_async(
     output: &mut (impl AsyncWrite + Unpin + Send + AsyncSeekExt),
     all_entries: &[Entry],
@@ -128,14 +82,8 @@ pub async fn write_directories_async(
     .await
 }
 
-#[duplicate_item(
-    fn_name                            cfg_async_filter       async   SeekFrom                input_traits                                      add_await(code) write_directory(directory, output, compression);
-    [only_leaf_pointer_strategy]       [cfg(all())]           []      [std::io::SeekFrom]     [(impl Write + Seek)]                             [code]          [directory.to_writer(output, compression)];
-    [only_leaf_pointer_strategy_async] [cfg(feature="async")] [async] [futures::io::SeekFrom] [(impl AsyncWrite + Unpin + Send + AsyncSeekExt)] [code.await]    [directory.to_async_writer(output, compression).await];
-)]
-#[cfg_async_filter]
-async fn fn_name(
-    output: &mut input_traits,
+async fn only_leaf_pointer_strategy_async(
+    output: &mut (impl AsyncWrite + Unpin + Send + AsyncSeekExt),
     root_dir_start: SeekFrom,
     all_entries: &[Entry],
     compression: Compression,
@@ -155,10 +103,12 @@ async fn fn_name(
             }
 
             let leaf_dir = Directory::from(entries.to_vec());
-            let offset = leaf_dir_writer.stream_position()?;
-            leaf_dir.to_writer(&mut leaf_dir_writer, compression)?;
+            let offset = leaf_dir_writer.stream_position().await?;
+            leaf_dir
+                .to_async_writer(&mut leaf_dir_writer, compression)
+                .await?;
             #[allow(clippy::cast_possible_truncation)]
-            let length = (leaf_dir_writer.stream_position()? - offset) as u32;
+            let length = (leaf_dir_writer.stream_position().await? - offset) as u32;
 
             root_entries.push(Entry {
                 tile_id: entries[0].tile_id,
@@ -170,9 +120,9 @@ async fn fn_name(
 
         let root_directory = Directory::from(root_entries);
 
-        let start_pos = add_await([output.seek(root_dir_start)])?;
-        write_directory([root_directory], [output], [compression])?;
-        let root_directory_length = add_await([output.stream_position()])? - start_pos;
+        let start_pos = output.seek(root_dir_start).await?;
+        root_directory.to_async_writer(output, compression).await?;
+        let root_directory_length = output.stream_position().await? - start_pos;
 
         if root_directory_length <= u64::from(MAX_ROOT_DIR_LENGTH) {
             return Ok(leaf_dir_bytes);
