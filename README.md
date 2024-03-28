@@ -5,6 +5,7 @@ This crate includes a low level implementation of [the PMTiles format](https://g
 It also contains [some utilities](https://docs.rs/pmtiles2/latest/pmtiles2/util/), which might become handy when working with PMTiles archives. Among others these include functions for (de-)compression with all algorithms supported by PMTiles, as well as functions to convert from and to tile ids.
 
 ## Documentation
+
 See [RustDoc Documentation](https://docs.rs/pmtiles2).
 
 The documentation includes some examples.
@@ -12,6 +13,7 @@ The documentation includes some examples.
 ## Installation
 
 Add following lines to your Cargo.toml:
+
 ```toml
 # Cargo.toml
 [dependencies]
@@ -21,7 +23,9 @@ pmtiles2 = "0.2"
 ## Features
 
 ### `serde`
+
 With this feature enabled most public types are (de-)serializable by [serde](https://crates.io/crates/serde).
 
 ### `async`
+
 With this feature enabled all readable / writable types also support asynchronous readers / writers via the [AsyncRead](https://docs.rs/futures/latest/futures/io/trait.AsyncRead.html) and [AsyncWrite](https://docs.rs/futures/latest/futures/io/trait.AsyncWrite.html) traits from the [`futures`-crate](https://docs.rs/futures/latest/futures/index.html).
