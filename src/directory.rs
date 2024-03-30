@@ -1,10 +1,10 @@
-use crate::util::compress_async;
+use crate::util::{compress_async, decompress_async};
 use crate::Compression;
 use anyhow::Result;
-use integer_encoding::VarIntAsyncWriter;
+use integer_encoding::{VarIntAsyncReader, VarIntAsyncWriter};
 use std::ops::{Index, IndexMut, Range};
 use std::slice::SliceIndex;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tracing::trace;
 
 /// A structure representing a directory entry.
@@ -72,55 +72,58 @@ impl Directory {
 
 impl Directory {
     // #[allow(clippy::needless_range_loop)]
-    // async fn from_async_reader(
-    //     input: &mut (impl AsyncRead + Unpin + Send + AsyncReadExt),
-    //     length: u64,
-    //     compression: Compression,
-    // ) -> Result<Self> {
-    //     let mut binding = input.take(length);
-    //     let mut reader = decompress_async(compression, &mut binding)?;
+    pub async fn from_async_reader<R>(
+        reader: &mut R,
+        length: u64,
+        compression: Compression,
+    ) -> Result<Self>
+    where
+        R: AsyncRead + AsyncSeekExt + Unpin + Send,
+    {
+        let mut binding = reader.take(length);
+        let mut reader = decompress_async(compression, &mut binding)?;
 
-    //     let num_entries = reader.read_varint_async::<usize>().await?;
+        let num_entries = reader.read_varint_async::<usize>().await?;
 
-    //     let mut entries = Vec::<Entry>::with_capacity(num_entries);
+        let mut entries = Vec::<Entry>::with_capacity(num_entries);
 
-    //     // read tile_id
-    //     let mut last_id = 0u64;
-    //     for _ in 0..num_entries {
-    //         let tmp = reader.read_varint_async::<u64>().await?;
+        // read tile_id
+        let mut last_id = 0u64;
+        for _ in 0..num_entries {
+            let tmp = reader.read_varint_async::<u64>().await?;
 
-    //         last_id += tmp;
-    //         entries.push(Entry {
-    //             tile_id: last_id,
-    //             length: 0,
-    //             offset: 0,
-    //             run_length: 0,
-    //         });
-    //     }
+            last_id += tmp;
+            entries.push(Entry {
+                tile_id: last_id,
+                length: 0,
+                offset: 0,
+                run_length: 0,
+            });
+        }
 
-    //     // read run_length
-    //     for i in 0..num_entries {
-    //         entries[i].run_length = reader.read_varint_async::<_>().await?;
-    //     }
+        // read run_length
+        for i in 0..num_entries {
+            entries[i].run_length = reader.read_varint_async::<_>().await?;
+        }
 
-    //     // read length
-    //     for i in 0..num_entries {
-    //         entries[i].length = reader.read_varint_async::<_>().await?;
-    //     }
+        // read length
+        for i in 0..num_entries {
+            entries[i].length = reader.read_varint_async::<_>().await?;
+        }
 
-    //     // read offset
-    //     for i in 0..num_entries {
-    //         let val = reader.read_varint_async::<u64>().await?;
+        // read offset
+        for i in 0..num_entries {
+            let val = reader.read_varint_async::<u64>().await?;
 
-    //         entries[i].offset = if i > 0 && val == 0 {
-    //             entries[i - 1].offset + u64::from(entries[i - 1].length)
-    //         } else {
-    //             val - 1
-    //         };
-    //     }
+            entries[i].offset = if i > 0 && val == 0 {
+                entries[i - 1].offset + u64::from(entries[i - 1].length)
+            } else {
+                val - 1
+            };
+        }
 
-    //     Ok(Self { entries })
-    // }
+        Ok(Self { entries })
+    }
 
     /// Reads a directory from a [`futures::io::AsyncRead`](https://docs.rs/futures/latest/futures/io/trait.AsyncRead.html) and returns it.
     ///
@@ -129,7 +132,7 @@ impl Directory {
     pub async fn to_async_writer(
         &self,
         output: &mut (impl AsyncWrite + Unpin + Send),
-        compression: Compression,
+        compression: &Compression,
     ) -> Result<()> {
         let mut writer = compress_async(compression, output)?;
 

@@ -72,7 +72,7 @@ pub fn compress<'a>(
 ///
 #[allow(clippy::module_name_repetitions)]
 pub fn compress_async<'a>(
-    compression: Compression,
+    compression: &Compression,
     writer: &'a mut (impl AsyncWrite + Unpin + Send),
 ) -> Result<Box<dyn AsyncWrite + Unpin + Send + 'a>> {
     match compression {

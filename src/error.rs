@@ -11,4 +11,7 @@ pub enum PmTilesError {
     /// Unable to perform compression operation without a compression scheme
     #[error("a required compression scheme wasn't set")]
     CompressionSchemeNotSet,
+
+    #[error("hashing a remote reader is not supported")]
+    UnsupportedHashOfRemoteReader,
 }

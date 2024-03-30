@@ -56,7 +56,7 @@ impl WriteDirsOverflowStrategy {
 pub async fn write_directories_async(
     output: &mut (impl AsyncWrite + Unpin + Send + AsyncSeekExt),
     all_entries: &[Entry],
-    compression: Compression,
+    compression: &Compression,
     overflow_strategy: WriteDirsOverflowStrategy,
 ) -> Result<Vec<u8>> {
     let start_pos = output.stream_position().await?;
@@ -86,7 +86,7 @@ async fn only_leaf_pointer_strategy_async(
     output: &mut (impl AsyncWrite + Unpin + Send + AsyncSeekExt),
     root_dir_start: SeekFrom,
     all_entries: &[Entry],
-    compression: Compression,
+    compression: &Compression,
     start_size: WriteDirsOverflowStrategy,
 ) -> Result<Vec<u8>> {
     let mut leaf_size = start_size.leaf_size();

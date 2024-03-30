@@ -1,26 +1,29 @@
-// #[cfg(feature = "async")]
-// use async_recursion::async_recursion;
-// #[cfg(feature = "async")]
-// use futures::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
-// use std::collections::HashMap;
-// use std::io::{Read, Result, Seek};
-// use std::ops::RangeBounds;
+use ahash::RandomState;
+use async_recursion::async_recursion;
+use std::{collections::HashMap, io::SeekFrom, ops::RangeBounds};
+use tokio::io::{AsyncRead, AsyncSeekExt};
 
-// use ahash::RandomState;
-// use duplicate::duplicate_item;
+use anyhow::Result;
 
-// use crate::{Compression, Directory};
+use crate::{Compression, Directory};
 
-// /// A structure representing a range of bytes within a larger amount of bytes.
-// #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-// #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-// pub struct OffsetLength {
-//     /// Offset of first byte (in bytes)
-//     pub offset: u64,
+/// A structure representing a range of bytes within a larger amount of bytes.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct OffsetLength {
+    /// Offset of first byte (in bytes)
+    pub offset: u64,
 
-//     /// Number of bytes in the range
-//     pub length: u32,
-// }
+    /// Number of bytes in the range
+    pub length: u32,
+}
+
+impl OffsetLength {
+    /// Create a new `OffsetLength` instance.
+    pub const fn new(offset: u64, length: u32) -> Self {
+        Self { offset, length }
+    }
+}
 
 // /// Reads directories (root- & leaf-directories) from a reader and return all entries
 // /// as a [`std::collections::HashMap`], with the tile-id as the key and the offset & length as the value.
@@ -111,13 +114,16 @@
 // /// ```
 // #[allow(clippy::module_name_repetitions)]
 // #[cfg(feature = "async")]
-// pub async fn read_directories_async(
-//     reader: &mut (impl AsyncRead + Unpin + Send + AsyncReadExt + AsyncSeekExt),
+// pub async fn read_directories_async<R>(
+//     reader: &mut R,
 //     compression: Compression,
 //     root_dir_offset_length: (u64, u64),
 //     leaf_dir_offset: u64,
 //     filter_range: (impl RangeBounds<u64> + Sync + Send),
-// ) -> Result<HashMap<u64, OffsetLength, RandomState>> {
+// ) -> Result<HashMap<u64, OffsetLength, RandomState>>
+// where
+//     R: AsyncRead + AsyncSeekExt + Unpin + Send,
+// {
 //     let mut tiles = HashMap::<u64, OffsetLength, RandomState>::default();
 
 //     read_dir_rec_async(
@@ -133,16 +139,16 @@
 //     Ok(tiles)
 // }
 
-// /// Get (inclusive) end of range bounds.
-// ///
-// /// Will return [`None`] if range has no end bound.
-// fn range_end_inc(range: &impl RangeBounds<u64>) -> Option<u64> {
-//     match range.end_bound() {
-//         std::ops::Bound::Included(val) => Some(*val),
-//         std::ops::Bound::Excluded(val) => Some(*val - 1),
-//         std::ops::Bound::Unbounded => None,
-//     }
-// }
+/// Get (inclusive) end of range bounds.
+///
+/// Will return [`None`] if range has no end bound.
+fn range_end_inc(range: &impl RangeBounds<u64>) -> Option<u64> {
+    match range.end_bound() {
+        std::ops::Bound::Included(val) => Some(*val),
+        std::ops::Bound::Excluded(val) => Some(*val - 1),
+        std::ops::Bound::Unbounded => None,
+    }
+}
 
 // #[duplicate_item(
 //     fn_name              cfg_async_filter       async                      add_await(code) seek_start(reader, offset)                                 FilterRangeTraits                       input_traits                                                    read_directory(reader, len, compression);
@@ -150,123 +156,131 @@
 //     [read_dir_rec_async] [cfg(feature="async")] [#[async_recursion] async] [code.await]    [reader.seek(futures::io::SeekFrom::Start(offset)).await]  [(impl RangeBounds<u64> + Sync + Send)] [(impl AsyncRead + Unpin + Send + AsyncReadExt + AsyncSeekExt)] [Directory::from_async_reader(reader, len, compression).await];
 // )]
 // #[cfg_async_filter]
-// async fn fn_name(
-//     reader: &mut input_traits,
-//     tiles: &mut HashMap<u64, OffsetLength, RandomState>,
-//     compression: Compression,
-//     (dir_offset, dir_length): (u64, u64),
-//     leaf_dir_offset: u64,
-//     filter_range: &FilterRangeTraits,
-// ) -> Result<()> {
-//     seek_start([reader], [dir_offset])?;
-//     let directory = read_directory([reader], [dir_length], [compression])?;
-//     let range_end = range_end_inc(filter_range).unwrap_or(u64::MAX);
 
-//     for entry in &directory.entries {
-//         if entry.is_leaf_dir_entry() {
-//             // skip leaf directory, if it starts after range
-//             if entry.tile_id > range_end {
-//                 continue;
-//             }
+#[async_recursion]
+pub async fn read_dir_rec_async<R>(
+    reader: &mut R,
+    tiles: &mut HashMap<u64, OffsetLength, RandomState>,
+    compression: Compression,
+    (dir_offset, dir_length): (u64, u64),
+    leaf_dir_offset: u64,
+    filter_range: &(impl RangeBounds<u64> + Sync + Send),
+) -> Result<()>
+where
+    R: AsyncRead + AsyncSeekExt + Unpin + Send,
+{
+    // seek_start([reader], [dir_offset])?;
+    reader.seek(SeekFrom::Start(dir_offset)).await?;
 
-//             add_await([fn_name(
-//                 reader,
-//                 tiles,
-//                 compression,
-//                 (leaf_dir_offset + entry.offset, u64::from(entry.length)),
-//                 leaf_dir_offset,
-//                 filter_range,
-//             )])?;
-//             continue;
-//         }
+    // let directory = read_directory([reader], [dir_length], [compression])?;
+    let directory = Directory::from_async_reader(reader, dir_length, compression).await?;
 
-//         for tile_id in entry.tile_id_range() {
-//             if !filter_range.contains(&tile_id) {
-//                 continue;
-//             }
+    let range_end = range_end_inc(filter_range).unwrap_or(u64::MAX);
 
-//             tiles.insert(
-//                 tile_id,
-//                 OffsetLength {
-//                     offset: entry.offset,
-//                     length: entry.length,
-//                 },
-//             );
-//         }
-//     }
+    for entry in &directory.entries {
+        if entry.is_leaf_dir_entry() {
+            // skip leaf directory, if it starts after range
+            if entry.tile_id > range_end {
+                continue;
+            }
 
-//     Ok(())
-// }
+            read_dir_rec_async(
+                reader,
+                tiles,
+                compression,
+                (leaf_dir_offset + entry.offset, u64::from(entry.length)),
+                leaf_dir_offset,
+                filter_range,
+            )
+            .await?;
 
-// #[cfg(test)]
-// #[allow(clippy::unwrap_used)]
-// mod test {
-//     use std::io::{Cursor, Result};
+            continue;
+        }
 
-//     use super::*;
+        for tile_id in entry.tile_id_range() {
+            if !filter_range.contains(&tile_id) {
+                continue;
+            }
 
-//     #[test]
-//     fn test_read_directories_basic() -> Result<()> {
-//         let bytes: &[u8] = include_bytes!("../../test/stamen_toner(raster)CC-BY+ODbL_z3.pmtiles");
-//         let mut reader = Cursor::new(bytes);
+            tiles.insert(
+                tile_id,
+                OffsetLength {
+                    offset: entry.offset,
+                    length: entry.length,
+                },
+            );
+        }
+    }
 
-//         let map = read_directories(&mut reader, Compression::GZip, (127, 246), 395, ..)?;
+    Ok(())
+}
 
-//         assert_eq!(map.len(), 85);
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod test {
+    use crate::util::read_directories::range_end_inc;
+    // #[tokio::test]
+    // async fn test_read_directories_basic() -> Result<()> {
+    //     let bytes: &[u8] = include_bytes!("../../test/stamen_toner(raster)CC-BY+ODbL_z3.pmtiles");
+    //     let mut reader = Cursor::new(bytes);
 
-//         assert_eq!(
-//             map.get(&19).unwrap(),
-//             &OffsetLength {
-//                 offset: 225_929,
-//                 length: 11259
-//             }
-//         );
+    //     let map = read_dir_rec_async(&mut reader, Compression::GZip, (127, 246), 395, ..).await?;
 
-//         assert_eq!(
-//             map.get(&59).unwrap(),
-//             &OffsetLength {
-//                 offset: 422_070,
-//                 length: 850
-//             }
-//         );
+    //     assert_eq!(map.len(), 85);
 
-//         Ok(())
-//     }
+    //     assert_eq!(
+    //         map.get(&19).unwrap(),
+    //         &OffsetLength {
+    //             offset: 225_929,
+    //             length: 11259
+    //         }
+    //     );
 
-//     #[test]
-//     fn test_read_directories_with_leaf() -> Result<()> {
-//         let bytes: &[u8] =
-//             include_bytes!("../../test/protomaps_vector_planet_odbl_z10_without_data.pmtiles");
-//         let mut reader = Cursor::new(bytes);
+    //     assert_eq!(
+    //         map.get(&59).unwrap(),
+    //         &OffsetLength {
+    //             offset: 422_070,
+    //             length: 850
+    //         }
+    //     );
 
-//         let map = read_directories(&mut reader, Compression::GZip, (127, 389), 1173, ..)?;
+    //     Ok(())
+    // }
 
-//         assert_eq!(map.len(), 1_398_101);
+    // #[tokio::test]
+    // async fn test_read_directories_with_leaf() -> Result<()> {
+    //     let bytes: &[u8] =
+    //         include_bytes!("../../test/protomaps_vector_planet_odbl_z10_without_data.pmtiles");
+    //     let mut reader = Cursor::new(bytes);
 
-//         assert_eq!(
-//             map.get(&1_027_840).unwrap(),
-//             &OffsetLength {
-//                 offset: 1_105_402_834,
-//                 length: 59
-//             }
-//         );
+    //     let map =
+    //         read_directories_async(&mut reader, Compression::GZip, (127, 389), 1173, ..).await?;
 
-//         assert_eq!(
-//             map.get(&0).unwrap(),
-//             &OffsetLength {
-//                 offset: 0,
-//                 length: 92574
-//             }
-//         );
+    //     assert_eq!(map.len(), 1_398_101);
 
-//         Ok(())
-//     }
+    //     assert_eq!(
+    //         map.get(&1_027_840).unwrap(),
+    //         &OffsetLength {
+    //             offset: 1_105_402_834,
+    //             length: 59
+    //         }
+    //     );
 
-//     #[test]
-//     fn test_range_end_inc() {
-//         assert_eq!(range_end_inc(&(..)), None);
-//         assert_eq!(range_end_inc(&(..=3)), Some(3));
-//         assert_eq!(range_end_inc(&(..3)), Some(2));
-//         assert_eq!(range_end_inc(&(1..)), None);
-//     }
-// }
+    //     assert_eq!(
+    //         map.get(&0).unwrap(),
+    //         &OffsetLength {
+    //             offset: 0,
+    //             length: 92574
+    //         }
+    //     );
+
+    //     Ok(())
+    // }
+    #[test]
+    fn test_range_end_inc() {
+        assert_eq!(range_end_inc(&(..)), None);
+        assert_eq!(range_end_inc(&(..=3)), Some(3));
+        assert_eq!(range_end_inc(&(..3)), Some(2));
+        assert_eq!(range_end_inc(&(1..)), None);
+    }
+}

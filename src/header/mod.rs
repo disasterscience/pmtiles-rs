@@ -6,14 +6,13 @@ mod compression;
 mod lat_lng;
 mod tile_type;
 
-use deku::bitvec::BitView;
 use deku::prelude::*;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 pub const HEADER_BYTES: u8 = 127;
 
 /// A structure representing a `PMTiles` header.
-#[derive(DekuRead, DekuWrite, Debug)]
+#[derive(DekuRead, DekuWrite, Debug, Clone)]
 #[deku(magic = b"PMTiles")]
 #[deku(endian = "little")]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -119,17 +118,15 @@ impl Header {
     /// # Errors
     /// Will return [`Err`] an I/O error occurred while reading from `input`.
     ///
-    pub async fn from_async_reader(
-        input: &mut (impl AsyncRead + Unpin + Send),
-    ) -> std::io::Result<Self> {
-        let mut buf = [0; HEADER_BYTES as usize];
+    // pub async fn from_async_reader<R>(reader: &mut BufReader<R>) -> std::io::Result<Self> {
+    //     let mut buf = [0; HEADER_BYTES as usize];
 
-        input.read_exact(&mut buf).await?;
+    //     reader.read_exact(&mut buf).await?;
 
-        let (_, header) = Self::read(buf.to_vec().view_bits(), ())?;
+    //     let (_, header) = Self::read(buf.to_vec().view_bits(), ())?;
 
-        Ok(header)
-    }
+    //     Ok(header)
+    // }
 
     /// Async version of [`to_writer`](Self::to_writer).
     ///

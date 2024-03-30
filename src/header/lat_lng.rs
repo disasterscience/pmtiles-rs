@@ -3,7 +3,7 @@ use deku::{
     prelude::*,
 };
 
-#[derive(DekuRead, DekuWrite, Debug, PartialEq)]
+#[derive(DekuRead, DekuWrite, Debug, PartialEq, Clone)]
 #[deku(endian = "endian", ctx = "_endian: deku::ctx::Endian")]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct LatLng {

@@ -1,12 +1,12 @@
 [package]
 name = "pmtiles2"
-version = "0.2.3"
+version = "0.0.1"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/arma-place/pmtiles-rs/"
+repository = "https://github.com/disasterscience/pmtiles-rs/"
 documentation = "https://docs.rs/pmtiles2"
 readme = "README.md"
-description = "A low level implementation of the PMTiles format based on the standard Read and Write (or AsyncRead and AsyncWrite) traits."
+description = "A low level implementation of the PMTiles format based around Tokio."
 categories = ["encoding", "parser-implementations", "parsing"]
 keywords = ["pmtiles", "format", "pmtile", "encoding", "decoding"]
 
@@ -15,15 +15,6 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-# [features]
-# serde = ["dep:serde"]
-# async = [
-#     "dep:futures",
-#     "dep:async-compression",
-#     "dep:async-recursion",
-#     "integer-encoding/futures_async",
-# ]
 
 [dependencies]
 hilbert_2d = "1"
@@ -38,23 +29,28 @@ ahash = { version = "0.8.2", default-features = false, features = [
     "std",
     "no-rng",
 ] }
-# futures = { version = "0.3.25" }
 async-compression = { version = "0.3.15", features = [
     "tokio",
     "zstd",
     "gzip",
     "brotli",
 ] }
-# duplicate = "1.0.0"
 async-recursion = { version = "1.0.4" }
 tracing = "0.1.40"
-tokio = { version = "1.27.0", features = ["fs"] }
+tokio = { version = "1.27.0", features = ["fs", "sync", "io-util"] }
 anyhow = "1.0.81"
 thiserror = "1.0.58"
 blake3 = { version = "1.5.1", features = ["rayon", "mmap"] }
+async-trait = "0.1.79"
 
 [dev-dependencies]
 temp-dir = "0.1"
-tokio = { version = "1.27.0", features = ["fs"] }
-tokio-test = "0.4.2"
-tokio-util = { version = "0.7.7", features = ["compat"] }
+tokio = { version = "1.27.0", features = [
+    "fs",
+    "rt-multi-thread",
+    "macros",
+    "io-util",
+] }
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+# tokio-test = "0.4.2"
+# tokio-util = { version = "0.7.7", features = ["compat"] }
