@@ -7,11 +7,16 @@ use anyhow::Result;
 use std::{
     collections::{HashMap, HashSet},
     io::SeekFrom,
+    path::{Path, PathBuf},
 };
-use tracing::trace;
+use tracing::{debug, info, trace};
+use walkdir::WalkDir;
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncSeekExt, AsyncWrite, AsyncWriteExt};
+use tokio::{
+    fs::File,
+    io::{AsyncSeekExt, AsyncWrite, AsyncWriteExt},
+};
 
 use crate::{
     header::HEADER_BYTES,
@@ -57,104 +62,6 @@ impl PMTilesWriter {
         }
     }
 
-    /// Writes the archive to a writer.
-    ///
-    /// # Errors
-    /// Will return an error if the internal compression of the archive is set to "Unknown" or an I/O error occurred while writing to `output`.
-    #[allow(clippy::wrong_self_convention, clippy::too_many_lines)]
-    pub async fn write(
-        self,
-        output: &mut (impl AsyncWrite + Send + Unpin + AsyncSeekExt),
-    ) -> Result<()> {
-        let finalised = self.build()?;
-
-        trace!("Writing PMTiles archive");
-
-        // ROOT DIR
-        output
-            .seek(SeekFrom::Current(i64::from(HEADER_BYTES)))
-            .await?;
-        let root_directory_offset = u64::from(HEADER_BYTES);
-        let leaf_directories_data = write_directories_async(
-            output,
-            &finalised.directory[0..],
-            &finalised.header.internal_compression,
-            WriteDirsOverflowStrategy::default(),
-        )
-        .await?;
-        let root_directory_length = output.stream_position().await? - root_directory_offset;
-
-        trace!(
-            "Root directory offset: {:x}, len: {}",
-            root_directory_offset,
-            root_directory_length
-        );
-
-        // META DATA
-        let json_metadata_offset = root_directory_offset + root_directory_length;
-        {
-            let mut compression_writer =
-                compress_async(&finalised.header.internal_compression, output)?;
-            let vec = serde_json::to_vec(&finalised.metadata)?;
-            compression_writer.write_all(&vec).await?;
-
-            compression_writer.flush().await?;
-        }
-        let json_metadata_length = output.stream_position().await? - json_metadata_offset;
-
-        trace!(
-            "Metadata offset: {:x}, len: {}",
-            json_metadata_offset,
-            json_metadata_length
-        );
-
-        // LEAF DIRECTORIES
-        let leaf_directories_offset = json_metadata_offset + json_metadata_length;
-        output.write_all(&leaf_directories_data[0..]).await?;
-        drop(leaf_directories_data);
-        let leaf_directories_length = output.stream_position().await? - leaf_directories_offset;
-
-        trace!(
-            "Leaf directorry offset: {:x}, len: {}",
-            leaf_directories_offset,
-            leaf_directories_length
-        );
-
-        // DATA
-        let tile_data_offset = leaf_directories_offset + leaf_directories_length;
-        let tile_count = finalised.tiles.len();
-        for tile in finalised.tiles {
-            if let Ok(content) = tile.read_payload().await {
-                output.write_all(&content).await?;
-            }
-        }
-
-        trace!(
-            "Tile data offset: {:x}, len: {}, tile count: {}",
-            tile_data_offset,
-            finalised.header.tile_data_length,
-            tile_count
-        );
-
-        output
-            .seek(SeekFrom::Start(
-                root_directory_offset - u64::from(HEADER_BYTES),
-            ))
-            .await?; // jump to start of stream
-
-        finalised.header.to_async_writer(output).await?;
-
-        output
-            .seek(SeekFrom::Start(
-                (root_directory_offset - u64::from(HEADER_BYTES))
-                    + tile_data_offset
-                    + finalised.header.tile_data_length,
-            ))
-            .await?; // jump to end of stream
-
-        Ok(())
-    }
-
     /// Adds a tile to this `PMTiles` archive.
     ///
     /// Note that the data should already be compressed if [`Self::tile_compression`] is set to a value other than [`Compression::None`].
@@ -186,6 +93,88 @@ impl PMTilesWriter {
 
         // Allow the tile to be found by its hash
         self.hash_to_tile.insert(tile.hash, tile);
+    }
+
+    /// Load files from the folder and add to the `PMTiles` archive.
+    /// Assumes the folder is structured: /tileset/{z}/{x}/{y}.png
+    ///
+    /// # Returns
+    /// The number of tiles added to the archive.
+    ///
+    /// # Errors
+    /// Returns an error if the directory cannot be read or the files cannot be loaded.
+    ///
+    #[allow(clippy::cognitive_complexity)]
+    pub fn add_tiles_from_folder(&mut self, directory: &Path) -> Result<usize> {
+        // Iterate over all files in the directory
+        // For each file, add the tile to the PMTiles archive
+
+        trace!("Loading z/x/y tiles from folder: {:?}", directory);
+
+        let mut count = 0;
+        let mut current_zoom_level = 0;
+
+        let entries = WalkDir::new(directory)
+            .into_iter()
+            .filter_map(std::result::Result::ok);
+
+        for entry in entries {
+            let path = entry.path();
+            if let Some((z, x, y)) = self.extract_zxy_from_path(path) {
+                // Convert TMS to XYZ
+                let y = (1 << z) - 1 - y;
+                let tile_id = tile_id(z, x, y);
+
+                trace!(
+                    "loading: {:?}, z: {}, x: {}, y: {}, tile_id: {}",
+                    &path,
+                    z,
+                    x,
+                    y,
+                    tile_id
+                );
+
+                // Log the zoom level if it changes
+                if current_zoom_level.ne(&z) {
+                    info!("Loading zoom level: {}", z);
+                    current_zoom_level = z;
+                }
+
+                self.add_tile(tile_id, PathBuf::from(path))?;
+                count += 1;
+            } else if path.is_file() {
+                debug!("Could not extract z, x, y and type from path: {:?}", &path);
+            }
+        }
+
+        Ok(count)
+    }
+
+    /// Given a file path, extract the z, x, and y values from the path
+    /// Assuming the structure is /tmp/pmtiles/act/{z}/{x}/{y}.png
+    fn extract_zxy_from_path(&self, path: &Path) -> Option<(u8, u64, u64)> {
+        let parts: Vec<&str> = path.to_str()?.split('/').collect();
+
+        // Adjust the indices if your base path changes
+        if parts.len() >= 3 {
+            let z_index = parts.len() - 3;
+            let x_index = parts.len() - 2;
+            let y_index = parts.len() - 1;
+
+            if let (Ok(z), Ok(x), Some(y_with_extension)) = (
+                parts[z_index].parse::<u8>(),
+                parts[x_index].parse::<u64>(),
+                parts.get(y_index),
+            ) {
+                // Strip the ".png" extension from y
+                let y = y_with_extension
+                    .trim_end_matches(self.header.tile_type.file_suffix())
+                    .parse::<u32>()
+                    .ok()?;
+                return Some((z, x, y.into()));
+            }
+        }
+        None
     }
 
     /// Removes a tile from this archive.
@@ -273,7 +262,7 @@ impl PMTilesWriter {
     ///
     /// # Errors
     /// Will return an error if something isn't quite right
-    pub fn build(self) -> Result<FinalisedWriter> {
+    pub fn build(self) -> Result<FinalisedPMTilesWriter> {
         let mut tiles_sorted_by_id = self.get_tile_ids();
         tiles_sorted_by_id.sort();
 
@@ -328,7 +317,7 @@ impl PMTilesWriter {
         header.num_tile_entries = entries.len() as u64;
         header.num_tile_content = num_tile_content;
 
-        let finalised_tiles = FinalisedWriter {
+        let finalised_tiles = FinalisedPMTilesWriter {
             tiles,
             directory: entries.into(),
             header,
@@ -339,13 +328,128 @@ impl PMTilesWriter {
     }
 }
 
+impl Default for PMTilesWriter {
+    fn default() -> Self {
+        Self::new(TileType::Png, Compression::None)
+    }
+}
+
 #[allow(clippy::module_name_repetitions)]
 #[derive(Debug)]
-pub struct FinalisedWriter {
+pub struct FinalisedPMTilesWriter {
     pub header: Header,
     pub metadata: Value,
     pub directory: Directory,
     pub tiles: Vec<Tile>,
+}
+
+impl FinalisedPMTilesWriter {
+    /// Write the `PMTiles` archive to a file.
+    ///
+    /// # Errors
+    /// Returns an error if the file cannot be created or the `PMTiles` archive cannot be written.
+    pub async fn write_to_file(self, path: PathBuf) -> Result<()> {
+        info!("Writing PMTiles to file: {:?}", &path);
+        let mut file = File::create(path).await?;
+        self.write(&mut file).await?;
+
+        Ok(())
+    }
+
+    /// Writes the archive to a writer.
+    ///
+    /// # Errors
+    /// Will return an error if the internal compression of the archive is set to "Unknown" or an I/O error occurred while writing to `output`.
+    #[allow(clippy::wrong_self_convention, clippy::too_many_lines)]
+    pub async fn write(
+        self,
+        output: &mut (impl AsyncWrite + Send + Unpin + AsyncSeekExt),
+    ) -> Result<()> {
+        trace!("Writing PMTiles archive");
+
+        // ROOT DIR
+        output
+            .seek(SeekFrom::Current(i64::from(HEADER_BYTES)))
+            .await?;
+        let root_directory_offset = u64::from(HEADER_BYTES);
+        let leaf_directories_data = write_directories_async(
+            output,
+            &self.directory[0..],
+            &self.header.internal_compression,
+            WriteDirsOverflowStrategy::default(),
+        )
+        .await?;
+        let root_directory_length = output.stream_position().await? - root_directory_offset;
+
+        trace!(
+            "Root directory offset: {:x}, len: {}",
+            root_directory_offset,
+            root_directory_length
+        );
+
+        // META DATA
+        let json_metadata_offset = root_directory_offset + root_directory_length;
+        {
+            let mut compression_writer = compress_async(&self.header.internal_compression, output)?;
+            let vec = serde_json::to_vec(&self.metadata)?;
+            compression_writer.write_all(&vec).await?;
+
+            compression_writer.flush().await?;
+        }
+        let json_metadata_length = output.stream_position().await? - json_metadata_offset;
+
+        trace!(
+            "Metadata offset: {:x}, len: {}",
+            json_metadata_offset,
+            json_metadata_length
+        );
+
+        // LEAF DIRECTORIES
+        let leaf_directories_offset = json_metadata_offset + json_metadata_length;
+        output.write_all(&leaf_directories_data[0..]).await?;
+        drop(leaf_directories_data);
+        let leaf_directories_length = output.stream_position().await? - leaf_directories_offset;
+
+        trace!(
+            "Leaf directorry offset: {:x}, len: {}",
+            leaf_directories_offset,
+            leaf_directories_length
+        );
+
+        // DATA
+        let tile_data_offset = leaf_directories_offset + leaf_directories_length;
+        let tile_count = self.tiles.len();
+        for tile in self.tiles {
+            if let Ok(content) = tile.read_payload().await {
+                output.write_all(&content).await?;
+            }
+        }
+
+        trace!(
+            "Tile data offset: {:x}, len: {}, tile count: {}",
+            tile_data_offset,
+            self.header.tile_data_length,
+            tile_count
+        );
+
+        output
+            .seek(SeekFrom::Start(
+                root_directory_offset - u64::from(HEADER_BYTES),
+            ))
+            .await?; // jump to start of stream
+
+        self.header.to_async_writer(output).await?;
+
+        output
+            .seek(SeekFrom::Start(
+                (root_directory_offset - u64::from(HEADER_BYTES))
+                    + tile_data_offset
+                    + self.header.tile_data_length,
+            ))
+            .await?; // jump to end of stream
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -628,6 +732,29 @@ mod test {
         assert!(directory[1].offset > directory[0].offset);
         assert!(directory[2].offset > directory[1].offset);
         assert!(directory[3].offset > directory[2].offset);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_tiles_from_folder() -> Result<()> {
+        init_logging();
+
+        let mut writer = PMTilesWriter::new(TileType::Png, Compression::GZip);
+
+        let input_folder = std::path::Path::new("test/act");
+        let output_file = std::path::Path::new("test/test_add_tiles_from_folder.pmtiles");
+
+        let count = writer.add_tiles_from_folder(input_folder)?;
+        assert_eq!(count, 6);
+
+        let result = writer.build()?;
+        assert_eq!(result.directory.len(), 6);
+        assert_eq!(result.header.num_tile_entries, 6);
+        assert_eq!(result.header.num_addressed_tiles, 6);
+        assert_eq!(result.header.num_tile_content, 6);
+
+        result.write_to_file(output_file.to_path_buf()).await?;
 
         Ok(())
     }

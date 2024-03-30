@@ -36,13 +36,16 @@
 //!     // create temp directory
 //!     let dir = temp_dir::TempDir::new()?;
 //!     let file_path = dir.path().join("foo.pmtiles");
+//!
+//!     // Initialise writer
 //!     let mut pm_tiles = PMTilesWriter::new(TileType::Png, Compression::GZip);
 //!
+//!     // Add tiles
 //!     pm_tiles.add_tile(tile_id(0, 0, 0), PathBuf::from("./test/act/14/14969/6467.png"));
 //!     pm_tiles.add_tile(tile_id(0, 0, 0), PathBuf::from("./test/act/14/14969/6468.png"));
 //!
-//!     let mut file = File::create(file_path).await?;
-//!     pm_tiles.write(&mut file).await?;
+//!     // Write to file
+//!     pm_tiles.build()?.write_to_file(file_path).await?;
 //!
 //!     Ok(())
 //! }
