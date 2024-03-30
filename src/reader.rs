@@ -106,9 +106,9 @@ pub async fn parse_metadata(
     internal_compression: Compression,
     mut metadata_reader: BufReader<&[u8]>,
 ) -> Result<Value> {
-    let mut metadata_reader = decompress_async(internal_compression, &mut metadata_reader)?;
-    let mut json_bytes = Vec::with_capacity(2048);
-    metadata_reader.read_to_end(&mut json_bytes).await?;
+    let mut decompression_reader = decompress_async(internal_compression, &mut metadata_reader)?;
+    let mut json_bytes = Vec::new();
+    decompression_reader.read_to_end(&mut json_bytes).await?;
     let val: Value = serde_json::from_slice(&json_bytes[..])?;
     Ok(val)
 }

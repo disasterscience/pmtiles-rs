@@ -170,7 +170,7 @@ impl Directory {
             next_byte = entry.offset + u64::from(entry.length);
         }
 
-        writer.flush().await?;
+        writer.shutdown().await?;
 
         Ok(())
     }

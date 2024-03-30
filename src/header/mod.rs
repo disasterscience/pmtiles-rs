@@ -173,11 +173,11 @@ impl Default for Header {
             max_zoom: 0,
             min_pos: LatLng {
                 longitude: -180.0,
-                latitude: -85.0,
+                latitude: -90.0,
             },
             max_pos: LatLng {
                 longitude: 180.0,
-                latitude: 85.0,
+                latitude: 90.0,
             },
             center_zoom: 0,
             center_pos: LatLng {

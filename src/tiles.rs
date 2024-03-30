@@ -76,6 +76,7 @@ impl TileBackend {
             // The hash is calculated using the BLAKE3 algorithm (multi-threaded, fast, secure hash function
             Self::OnDisk(path) => {
                 let mut hasher = blake3::Hasher::new();
+                // hasher.update_mmap(path)?;
                 hasher.update_mmap_rayon(path)?;
 
                 let finalised_bytes = hasher.finalize();

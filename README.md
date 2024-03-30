@@ -1,31 +1,17 @@
-# PMTiles (for Rust) [![crates.io](https://img.shields.io/crates/v/pmtiles2?style=flat-square&logo=rust)](https://crates.io/crates/pmtiles2) [![docs.rs](https://img.shields.io/badge/docs.rs-pmtiles2-66c2a5.svg?logo=docs.rs&style=flat-square)](https://docs.rs/pmtiles2) [![build status](https://img.shields.io/github/actions/workflow/status/arma-place/pmtiles-rs/CI.yml?branch=master&style=flat-square)](https://github.com/arma-place/pmtiles-rs/actions?query=branch%3Amaster)
+# PMTiles (for Rust)
 
-This crate includes a low level implementation of [the PMTiles format](https://github.com/protomaps/PMTiles) based on the standard [Read](https://doc.rust-lang.org/std/io/trait.Read.html) and [Write](https://doc.rust-lang.org/std/io/trait.Write.html) (or [AsyncRead](https://docs.rs/futures/latest/futures/io/trait.AsyncRead.html) and [AsyncWrite](https://docs.rs/futures/latest/futures/io/trait.AsyncWrite.html) from the [`futures`-crate](https://docs.rs/futures/latest/futures/index.html)) traits.
+A low level implementation of [the `PMTiles` format](https://github.com/protomaps/PMTiles) refactored for Tokio and write workloads.
 
-It also contains [some utilities](https://docs.rs/pmtiles2/latest/pmtiles2/util/), which might become handy when working with PMTiles archives. Among others these include functions for (de-)compression with all algorithms supported by PMTiles, as well as functions to convert from and to tile ids.
+## Be ware of dragons 🐲
 
-## Documentation
+Originally forked from [pmtiles-rs, pmtiles2 crate](https://github.com/arma-place/pmtiles-rs/). Open to upstreaming, but there's quite few discretionary changes largely to improve DX, performance and some async bug fixes. It also doesn't work rn 🥲.
 
-See [RustDoc Documentation](https://docs.rs/pmtiles2).
+### Bench Rough Notes
 
-The documentation includes some examples.
+Test case: Loading 50GB, 500k XYZ tiles (zoom level 0-18) from 10Gbps NVME drive. In debug mode 😱.
 
-## Installation
+Blake3 update_mmap_rayon: load avg: 2,93, read average 15-16MB/s / Before Futures - 50 minutes to read
 
-Add following lines to your Cargo.toml:
+Blake3 update_mmap: load avg: 1.50, read average 7-8MB/s / Before Futures - Slower, and disconnected the drive :o
 
-```toml
-# Cargo.toml
-[dependencies]
-pmtiles2 = "0.2"
-```
-
-## Features
-
-### `serde`
-
-With this feature enabled most public types are (de-)serializable by [serde](https://crates.io/crates/serde).
-
-### `async`
-
-With this feature enabled all readable / writable types also support asynchronous readers / writers via the [AsyncRead](https://docs.rs/futures/latest/futures/io/trait.AsyncRead.html) and [AsyncWrite](https://docs.rs/futures/latest/futures/io/trait.AsyncWrite.html) traits from the [`futures`-crate](https://docs.rs/futures/latest/futures/index.html).
+Blake3 update_mmap_rayon: load avg: 30, read average 110MB/s / After, with concurrent read futures - 6 minutes to read.
