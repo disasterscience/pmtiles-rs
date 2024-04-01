@@ -4,22 +4,19 @@ use crate::{
     Directory, Entry,
 };
 use anyhow::Result;
-use futures::{stream::FuturesUnordered, StreamExt};
 use std::{
     collections::{HashMap, HashSet},
     io::SeekFrom,
     path::{Path, PathBuf},
-    sync::Arc,
 };
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 use walkdir::WalkDir;
 
 use serde_json::{json, Value};
 use tokio::{
     fs::File,
-    io::{AsyncSeekExt, AsyncWrite, AsyncWriteExt},
-    sync::Mutex,
-    task,
+    io::{AsyncSeekExt, AsyncWriteExt, BufWriter},
+    sync::mpsc,
 };
 
 use crate::{
@@ -28,6 +25,7 @@ use crate::{
     util::{compress_async, write_directories_async, WriteDirsOverflowStrategy},
     Compression, Header, TileType,
 };
+
 /// Manages writing a `PMTiles` archive
 #[allow(clippy::module_name_repetitions)]
 pub struct PMTilesWriter {
@@ -109,103 +107,54 @@ impl PMTilesWriter {
     /// Returns an error if the directory cannot be read or the files cannot be loaded.
     ///
     #[allow(clippy::cognitive_complexity)]
-    pub async fn add_tiles_from_folder(self, directory: &Path) -> Result<FinalisedPMTilesWriter> {
+    pub async fn add_tiles_from_folder(
+        mut self,
+        directory: &Path,
+    ) -> Result<FinalisedPMTilesWriter> {
         let entries = WalkDir::new(directory)
             .into_iter()
             .filter_map(std::result::Result::ok)
-            .collect::<Vec<_>>(); // Collect entries to allow async processing
+            .collect::<Vec<_>>();
 
-        let mut tasks = FuturesUnordered::new();
         let tile_type = self.header.tile_type;
-        let self_arc = Arc::new(Mutex::new(self));
 
-        for entry in entries {
-            let self_clone = self_arc.clone();
-            let path = entry.path().to_path_buf();
+        let (tx, mut rx) = mpsc::channel::<Tile>(128);
 
-            // Spawn a new task for each file
-            let task = task::spawn(async move {
+        // Read the tile data and send it to the writer, so ideally reads > writes
+        for (count, entry) in entries.into_iter().enumerate() {
+            let txc = tx.clone();
+            tokio::spawn(async move {
+                let path = entry.path().to_path_buf();
+
+                // Spawn a new task for each file
                 if let Some((z, x, y)) = Self::extract_zxy_from_path(&path, tile_type) {
-                    // Example conversion, adapt as necessary
+                    // Convert TMS to XYZ
                     let y = (1 << z) - 1 - y;
-                    let tile_id = tile_id(z, x, y); // Assuming tile_id is a function that computes a tile ID
+                    let tile_id = tile_id(z, x, y);
 
-                    if let Ok(tile) = Tile::new(tile_id, path.into()) {
-                        self_clone.lock().await.add(tile);
+                    // We're assuming small files could be similar, but large files are likely unique so don't bother hashing
+                    if let Ok(tile) = Tile::new_only_hash_small(
+                        tile_id,
+                        count.try_into().expect("hash failed"),
+                        path.into(),
+                    ) {
+                        txc.send(tile).await.expect("send tile failed");
                     }
                 }
             });
-
-            tasks.push(task);
         }
 
-        // Wait for all tasks to complete and process their results
-        while let Some(result) = tasks.next().await {
-            match result {
-                Ok(()) => {}
-                Err(e) => warn!("Task failed: {:?}", e),
-            }
+        drop(tx);
+
+        // Consume the tile data and write it to the output
+        while let Some(tile) = rx.recv().await {
+            self.add(tile);
         }
 
-        let finalised = self_arc.lock().await.build()?;
+        let finalised = self.build()?;
 
         Ok(finalised)
     }
-
-    /// Load files from the folder and add to the `PMTiles` archive.
-    /// Assumes the folder is structured: /tileset/{z}/{x}/{y}.png
-    ///
-    /// # Returns
-    /// The number of tiles added to the archive.
-    ///
-    /// # Errors
-    /// Returns an error if the directory cannot be read or the files cannot be loaded.
-    ///
-    // #[allow(clippy::cognitive_complexity)]
-    // pub fn add_tiles_from_folder(&mut self, directory: &Path) -> Result<usize> {
-    //     // Iterate over all files in the directory
-    //     // For each file, add the tile to the PMTiles archive
-
-    //     trace!("Loading z/x/y tiles from folder: {:?}", directory);
-
-    //     let mut count = 0;
-    //     let mut current_zoom_level = 0;
-
-    //     let entries = WalkDir::new(directory)
-    //         .into_iter()
-    //         .filter_map(std::result::Result::ok);
-
-    //     for entry in entries {
-    //         let path = entry.path();
-    //         if let Some((z, x, y)) = self.extract_zxy_from_path(path) {
-    //             // Convert TMS to XYZ
-    //             let y = (1 << z) - 1 - y;
-    //             let tile_id = tile_id(z, x, y);
-
-    //             trace!(
-    //                 "loading: {:?}, z: {}, x: {}, y: {}, tile_id: {}",
-    //                 &path,
-    //                 z,
-    //                 x,
-    //                 y,
-    //                 tile_id
-    //             );
-
-    //             // Log the zoom level if it changes
-    //             if current_zoom_level.ne(&z) {
-    //                 info!("Loading zoom level: {}", z);
-    //                 current_zoom_level = z;
-    //             }
-
-    //             self.add_tile(tile_id, PathBuf::from(path))?;
-    //             count += 1;
-    //         } else if path.is_file() {
-    //             debug!("Could not extract z, x, y and type from path: {:?}", &path);
-    //         }
-    //     }
-
-    //     Ok(count)
-    // }
 
     /// Given a file path, extract the z, x, and y values from the path
     /// Assuming the structure is /tmp/pmtiles/act/{z}/{x}/{y}.png
@@ -410,7 +359,8 @@ impl FinalisedPMTilesWriter {
     #[allow(clippy::wrong_self_convention, clippy::too_many_lines)]
     pub async fn write(
         mut self,
-        output: &mut (impl AsyncWrite + Send + Unpin + AsyncSeekExt),
+        // output: &mut (impl AsyncWrite + Send + Unpin + AsyncSeekExt),
+        mut output: File,
     ) -> Result<()> {
         trace!("Writing PMTiles archive");
 
@@ -420,7 +370,7 @@ impl FinalisedPMTilesWriter {
             .await?;
         let root_directory_offset = u64::from(HEADER_BYTES);
         let leaf_directories_data = write_directories_async(
-            output,
+            &mut output,
             &self.directory[0..],
             &self.header.internal_compression,
             WriteDirsOverflowStrategy::default(),
@@ -441,7 +391,8 @@ impl FinalisedPMTilesWriter {
             let vec = serde_json::to_vec(metadata)?;
             trace!("Writing metadata: {:?}, {:x?}", metadata, vec);
 
-            let mut compression_writer = compress_async(&self.header.internal_compression, output)?;
+            let mut compression_writer =
+                compress_async(&self.header.internal_compression, &mut output)?;
             compression_writer.write_all(&vec).await?;
             compression_writer.shutdown().await?;
         }
@@ -465,21 +416,9 @@ impl FinalisedPMTilesWriter {
             leaf_directories_length
         );
 
-        // DATA
+        // Calculate where the data will go
         let tile_data_offset = leaf_directories_offset + leaf_directories_length;
         let tile_count = self.tiles.len();
-        for tile in self.tiles {
-            if let Ok(content) = tile.read_payload().await {
-                output.write_all(&content).await?;
-            }
-        }
-
-        trace!(
-            "Tile data offset: {:x}, len: {}, tile count: {}",
-            tile_data_offset,
-            self.header.tile_data_length,
-            tile_count
-        );
 
         // Update header with values we now know
         self.header.root_directory_length = root_directory_length;
@@ -497,7 +436,7 @@ impl FinalisedPMTilesWriter {
             ))
             .await?; // jump to start of stream
 
-        self.header.to_async_writer(output).await?;
+        self.header.to_async_writer(&mut output).await?;
 
         output
             .seek(SeekFrom::Start(
@@ -507,6 +446,62 @@ impl FinalisedPMTilesWriter {
             ))
             .await?; // jump to end of stream
 
+        trace!(
+            "Writing tile data offset: {:x}, len: {}, tile count: {}",
+            tile_data_offset,
+            self.header.tile_data_length,
+            tile_count
+        );
+        // for tile in self.tiles {
+        //     if let Ok(content) = tile.read_payload().await {
+        //         output.write_all(&content).await?;
+        //     }
+        // }
+        Self::vector_tile_write(self.tiles, tile_data_offset, &mut output).await?;
+
+        Ok(())
+    }
+
+    async fn vector_tile_write(
+        tiles: Vec<Tile>,
+        data_offset: u64,
+        // output: &mut (impl AsyncWrite + Send + Unpin + AsyncSeekExt),
+        file: &mut File,
+    ) -> Result<()> {
+        let (tx, mut rx) = mpsc::channel::<(Vec<u8>, u64)>(2048);
+        let mut output = BufWriter::with_capacity(500 * 1024, file);
+
+        // Read the tile data and send it to the writer, so ideally reads > writes
+        tokio::spawn(async move {
+            // Calculate where the tiles will be written
+            let tile_offsets: Vec<u64> = tiles
+                .iter()
+                .scan(data_offset, |acc, tile| {
+                    let current_offset = *acc;
+                    *acc += u64::from(tile.len);
+                    Some(current_offset)
+                })
+                .collect();
+            for (tile, offset) in tiles.into_iter().zip(tile_offsets) {
+                if let Ok(tile_payload) = tile.read_payload().await {
+                    if let Err(e) = tx.send((tile_payload, offset)).await {
+                        warn!("Failed to send tile data: {:?}", e);
+                    }
+                }
+            }
+        });
+
+        // Consume the tile data and write it to the output
+        let mut count = 0;
+        while let Some((payload, offset)) = rx.recv().await {
+            output.seek(SeekFrom::Start(offset)).await?;
+            output.write_all(&payload).await?;
+            // output.flush().await?;
+            count += 1;
+        }
+
+        trace!("Wrote {} tiles", count);
+
         Ok(())
     }
 
@@ -515,9 +510,9 @@ impl FinalisedPMTilesWriter {
     /// # Errors
     /// Returns an error if the file cannot be created or the `PMTiles` archive cannot be written.
     pub async fn write_to_file(self, path: PathBuf) -> Result<()> {
-        trace!("Writing PMTiles to file: {:?}", &path);
-        let mut file = File::create(path).await?;
-        self.write(&mut file).await?;
+        debug!("Writing PMTiles to file: {:?}", &path);
+        let file = File::create(path).await?;
+        self.write(file).await?;
 
         Ok(())
     }
@@ -537,7 +532,7 @@ mod test {
         let _ = tracing_subscriber::registry()
             .with(
                 tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| "trace".into()),
+                    .unwrap_or_else(|_| "debug".into()),
             )
             .with(tracing_subscriber::fmt::layer())
             .try_init();

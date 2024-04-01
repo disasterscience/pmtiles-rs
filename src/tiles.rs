@@ -26,19 +26,31 @@ impl Tile {
         })
     }
 
-    // pub async fn new_from_reader(
-    //     tile_id: u64,
-    //     offset: u64,
-    //     len: u32,
-    //     reader: Arc<RwLock<dyn RemoteReader>>,
-    // ) -> Result<Self> {
-    //     Ok(Self {
-    //         hash: 0,
-    //         len,
-    //         backend: TileBackend::Remote(reader, OffsetLength::new(offset, len)),
-    //         tile_id,
-    //     })
-    // }
+    pub fn new_with_defined_hash(tile_id: u64, hash: u64, backend: TileBackend) -> Result<Self> {
+        Ok(Self {
+            hash,
+            len: backend.len()?,
+            backend,
+            tile_id,
+        })
+    }
+
+    pub fn new_only_hash_small(tile_id: u64, hash: u64, backend: TileBackend) -> Result<Self> {
+        let len = backend.len()?;
+
+        let hash = if len.lt(&100_000) {
+            backend.calculate_hash()?
+        } else {
+            hash
+        };
+
+        Ok(Self {
+            backend,
+            tile_id,
+            hash,
+            len,
+        })
+    }
 
     pub async fn read_payload(&self) -> Result<Vec<u8>> {
         match &self.backend {
@@ -61,7 +73,7 @@ impl Tile {
 
 impl TileBackend {
     /// Calculate a hash from either the vec of bytes or the file at the path
-    pub fn calculate_hash(&self) -> Result<u64> {
+    fn calculate_hash(&self) -> Result<u64> {
         match self {
             Self::InMemory(data) => {
                 let mut hasher = blake3::Hasher::new();
@@ -88,7 +100,7 @@ impl TileBackend {
         }
     }
 
-    pub fn len(&self) -> Result<u32> {
+    fn len(&self) -> Result<u32> {
         match self {
             Self::InMemory(data) => Ok(u32::try_from(data.len())?),
             Self::OnDisk(path) => {

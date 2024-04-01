@@ -43,7 +43,6 @@ thiserror = "1.0.58"
 blake3 = { version = "1.5.1", features = ["rayon", "mmap"] }
 async-trait = "0.1.79"
 walkdir = "2.5.0"
-futures = "0.3.30"
 
 [dev-dependencies]
 temp-dir = "0.1"
