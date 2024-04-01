@@ -9,7 +9,7 @@ use std::{
     io::SeekFrom,
     path::{Path, PathBuf},
 };
-use tracing::{debug, trace, warn};
+use tracing::{trace, warn};
 use walkdir::WalkDir;
 
 use serde_json::{json, Value};
@@ -121,9 +121,10 @@ impl PMTilesWriter {
         let (tx, mut rx) = mpsc::channel::<Tile>(128);
 
         // Read the tile data and send it to the writer, so ideally reads > writes
-        for (count, entry) in entries.into_iter().enumerate() {
-            let txc = tx.clone();
-            tokio::spawn(async move {
+
+        tokio::spawn(async move {
+            for (count, entry) in entries.into_iter().enumerate() {
+                let txc = tx.clone();
                 let path = entry.path().to_path_buf();
 
                 // Spawn a new task for each file
@@ -141,10 +142,8 @@ impl PMTilesWriter {
                         txc.send(tile).await.expect("send tile failed");
                     }
                 }
-            });
-        }
-
-        drop(tx);
+            }
+        });
 
         // Consume the tile data and write it to the output
         while let Some(tile) = rx.recv().await {
@@ -471,17 +470,31 @@ impl FinalisedPMTilesWriter {
         let (tx, mut rx) = mpsc::channel::<(Vec<u8>, u64)>(2048);
         let mut output = BufWriter::with_capacity(500 * 1024, file);
 
+        // Determine total size of all tiles
+        let data_size: u64 = tiles.iter().map(|t| u64::from(t.len)).sum();
+        let total_size: u64 = data_offset + data_size;
+
+        trace!("Pre-allocating entire output: {}", total_size);
+
+        // Pre-allocate space for all tiles, early error rather than half way through processing
+        output.seek(SeekFrom::Start(data_offset)).await?;
+        output
+            .write_all(&vec![0; usize::try_from(data_size)?])
+            .await?;
+
+        let tile_offsets: Vec<u64> = tiles
+            .iter()
+            .scan(data_offset, |acc, tile| {
+                let current_offset = *acc;
+                *acc += u64::from(tile.len);
+                Some(current_offset)
+            })
+            .collect();
+
         // Read the tile data and send it to the writer, so ideally reads > writes
         tokio::spawn(async move {
             // Calculate where the tiles will be written
-            let tile_offsets: Vec<u64> = tiles
-                .iter()
-                .scan(data_offset, |acc, tile| {
-                    let current_offset = *acc;
-                    *acc += u64::from(tile.len);
-                    Some(current_offset)
-                })
-                .collect();
+
             for (tile, offset) in tiles.into_iter().zip(tile_offsets) {
                 if let Ok(tile_payload) = tile.read_payload().await {
                     if let Err(e) = tx.send((tile_payload, offset)).await {
@@ -510,7 +523,7 @@ impl FinalisedPMTilesWriter {
     /// # Errors
     /// Returns an error if the file cannot be created or the `PMTiles` archive cannot be written.
     pub async fn write_to_file(self, path: PathBuf) -> Result<()> {
-        debug!("Writing PMTiles to file: {:?}", &path);
+        trace!("Writing PMTiles to file: {:?}", &path);
         let file = File::create(path).await?;
         self.write(file).await?;
 
