@@ -6,7 +6,7 @@ use crate::{
 use anyhow::Result;
 use std::{
     collections::{HashMap, HashSet},
-    io::SeekFrom,
+    io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 use tracing::{trace, warn};
@@ -117,31 +117,33 @@ impl PMTilesWriter {
             .collect::<Vec<_>>();
 
         let tile_type = self.header.tile_type;
+        let (tx, mut rx) = mpsc::channel::<Tile>(256);
 
-        let (tx, mut rx) = mpsc::channel::<Tile>(128);
-
-        // Read the tile data and send it to the writer, so ideally reads > writes
-
+        // Begin reading tiles, spawn first async to move tx inside (so it's later dropped)
         tokio::spawn(async move {
             for (count, entry) in entries.into_iter().enumerate() {
                 let txc = tx.clone();
-                let path = entry.path().to_path_buf();
 
-                // Spawn a new task for each file
-                if let Some((z, x, y)) = Self::extract_zxy_from_path(&path, tile_type) {
-                    // Convert TMS to XYZ
-                    let y = (1 << z) - 1 - y;
-                    let tile_id = tile_id(z, x, y);
+                // Enumerate directory, creating new tasks for each file
+                tokio::spawn(async move {
+                    let path = entry.path().to_path_buf();
 
-                    // We're assuming small files could be similar, but large files are likely unique so don't bother hashing
-                    if let Ok(tile) = Tile::new_only_hash_small(
-                        tile_id,
-                        count.try_into().expect("hash failed"),
-                        path.into(),
-                    ) {
-                        txc.send(tile).await.expect("send tile failed");
+                    // Spawn a new task for each file
+                    if let Some((z, x, y)) = Self::extract_zxy_from_path(&path, tile_type) {
+                        // Convert TMS to XYZ
+                        let y = (1 << z) - 1 - y;
+                        let tile_id = tile_id(z, x, y);
+
+                        // We're assuming small files could be similar, but large files are likely unique so don't bother hashing
+                        if let Ok(tile) = Tile::new_with_defined_hash(
+                            tile_id,
+                            count.try_into().expect("hash failed"),
+                            path.into(),
+                        ) {
+                            txc.send(tile).await.expect("send tile failed");
+                        }
                     }
-                }
+                });
             }
         });
 
@@ -456,7 +458,7 @@ impl FinalisedPMTilesWriter {
         //         output.write_all(&content).await?;
         //     }
         // }
-        Self::vector_tile_write(self.tiles, tile_data_offset, &mut output).await?;
+        Self::vector_tile_write(self.tiles, tile_data_offset, output).await?;
 
         Ok(())
     }
@@ -465,10 +467,13 @@ impl FinalisedPMTilesWriter {
         tiles: Vec<Tile>,
         data_offset: u64,
         // output: &mut (impl AsyncWrite + Send + Unpin + AsyncSeekExt),
-        file: &mut File,
+        file: File,
     ) -> Result<()> {
         let (tx, mut rx) = mpsc::channel::<(Vec<u8>, u64)>(2048);
-        let mut output = BufWriter::with_capacity(500 * 1024, file);
+
+        let mut output: std::fs::File = file.into_std().await;
+
+        // let mut output = BufWriter::with_capacity(500 * 1024, file);
 
         // Determine total size of all tiles
         let data_size: u64 = tiles.iter().map(|t| u64::from(t.len)).sum();
@@ -477,10 +482,8 @@ impl FinalisedPMTilesWriter {
         trace!("Pre-allocating entire output: {}", total_size);
 
         // Pre-allocate space for all tiles, early error rather than half way through processing
-        output.seek(SeekFrom::Start(data_offset)).await?;
-        output
-            .write_all(&vec![0; usize::try_from(data_size)?])
-            .await?;
+        output.seek(SeekFrom::Start(data_offset))?;
+        output.write_all(&vec![0; usize::try_from(data_size)?])?;
 
         let tile_offsets: Vec<u64> = tiles
             .iter()
@@ -507,9 +510,9 @@ impl FinalisedPMTilesWriter {
         // Consume the tile data and write it to the output
         let mut count = 0;
         while let Some((payload, offset)) = rx.recv().await {
-            output.seek(SeekFrom::Start(offset)).await?;
-            output.write_all(&payload).await?;
-            // output.flush().await?;
+            output.seek(SeekFrom::Start(offset))?;
+            output.write_all(&payload)?;
+            output.flush()?;
             count += 1;
         }
 

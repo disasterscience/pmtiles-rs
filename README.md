@@ -31,3 +31,12 @@ Without hashing and parallel load, channel for writing (256), BufWrite, write av
 [2024-04-01T03:23:51Z DEBUG magicgeo] Finished
 
 Hashing small files only and parallel load, channel for writing (2048), BufWrite, write average ~26MB/s: 14mins
+
+Add everything, no hashing, channel, BufWrite ~10-15MB/s but seems more correct?
+
+[2024-04-01T07:56:10Z INFO magicgeo] Initialising magicgeo v1.0.13-rc.1
+[2024-04-01T07:56:10Z INFO magicgeo] Loading z/x/y tiles from folder: "/mnt/f/act"
+[2024-04-01T07:57:01Z INFO magicgeo] Writing to file: "/mnt/f/act.pmtiles"
+[2024-04-01T08:43:37Z DEBUG magicgeo] Finished
+
+Remove Async for writing
