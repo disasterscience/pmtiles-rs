@@ -7,7 +7,7 @@ use anyhow::Result;
 use futures::{stream::FuturesUnordered, StreamExt};
 use std::{
     collections::{HashMap, HashSet},
-    io::{Seek, SeekFrom, Write},
+    io::{SeekFrom, Write},
     path::{Path, PathBuf},
 };
 use tracing::{trace, warn};
@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use tokio::{
     fs::File,
     io::{AsyncSeekExt, AsyncWriteExt},
-    sync::{mpsc, Mutex},
+    sync::mpsc,
     task::JoinHandle,
 };
 

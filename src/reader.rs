@@ -17,7 +17,7 @@ use crate::{
 
 #[allow(clippy::module_name_repetitions)]
 pub struct PMTilesReader<R> {
-    reader: Arc<RwLock<BufReader<R>>>,
+    _reader: Arc<RwLock<BufReader<R>>>,
     pub header: Header,
     pub metadata: Option<Value>,
     pub tiles: HashMap<u64, OffsetLength, RandomState>,
@@ -86,7 +86,7 @@ where
         let reader = Arc::new(RwLock::new(buf_reader));
 
         Ok(Self {
-            reader,
+            _reader: reader,
             header: pmtiles_header,
             metadata,
             tiles,
