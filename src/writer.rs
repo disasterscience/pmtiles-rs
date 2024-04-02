@@ -27,6 +27,7 @@ use crate::{
     util::{compress_async, write_directories_async, WriteDirsOverflowStrategy},
     Compression, Header, TileType,
 };
+use std::os::unix::fs::FileExt;
 
 /// Manages writing a `PMTiles` archive
 #[allow(clippy::module_name_repetitions)]
@@ -475,11 +476,6 @@ impl FinalisedPMTilesWriter {
             self.header.tile_data_length,
             tile_count
         );
-        // for tile in self.tiles {
-        //     if let Ok(content) = tile.read_payload().await {
-        //         output.write_all(&content).await?;
-        //     }
-        // }
         output.flush().await?;
 
         Self::vector_tile_write(self.tiles, tile_data_offset, output).await?;
@@ -493,14 +489,14 @@ impl FinalisedPMTilesWriter {
         // output: &mut (impl AsyncWrite + Send + Unpin + AsyncSeekExt),
         file: File,
     ) -> Result<()> {
-        let mut output = file.try_into_std().expect("cannot convert file");
+        let file = file.try_into_std().expect("cannot convert file");
 
         // Pre-allocate space for all tiles, early error rather than half way through processing
-        let data_size: u64 = tiles.iter().map(|t| u64::from(t.len)).sum();
-        let total_size: u64 = data_offset + data_size;
-        trace!("Pre-allocating entire output: {}", total_size);
-        output.seek(SeekFrom::Start(data_offset))?;
-        output.write_all(&vec![0; usize::try_from(data_size)?])?;
+        // let data_size: u64 = tiles.iter().map(|t| u64::from(t.len)).sum();
+        // let total_size: u64 = data_offset + data_size;
+        // trace!("Pre-allocating entire output: {}", total_size);
+        // output.seek(SeekFrom::Start(data_offset))?;
+        // output.write_all(&vec![0; usize::try_from(data_size)?])?;
 
         // Calculate the offsets for each tile
         let tile_offsets: Vec<u64> = tiles
@@ -564,14 +560,15 @@ impl FinalisedPMTilesWriter {
             Ok(())
         }));
 
-        let output = std::sync::Arc::new(Mutex::new(output));
+        // Annoyingly, the underlying file handle seems to be shared
+        // let output = std::sync::Arc::new(Mutex::new(file));
 
         // Create some writer workers
         for worker in 0..16 {
             let rx = rx.clone();
 
             // Open our own handle
-            let output = output.clone();
+            let mut output = file.try_clone().expect("failed to clone file handle");
 
             // Spawn the worker
             tasks.push(tokio::spawn(async move {
@@ -586,10 +583,16 @@ impl FinalisedPMTilesWriter {
                         );
                     }
                     let payload = tile.read_payload().await?;
-                    let mut output = output.lock().await;
-                    output.seek(SeekFrom::Start(offset))?;
-                    output.write_all(&payload)?;
-                    output.flush()?;
+
+                    {
+                        // Using seek + write requires a lock, as the underlying file descriptor is shared
+                        // let mut output = output.lock().await;
+                        // output_lock.seek(SeekFrom::Start(offset))?;
+
+                        // Write at doesn't need a lock
+                        output.write_at(&payload, offset)?;
+                        output.flush()?;
+                    }
                     task_count += 1;
                 }
                 Ok(())
@@ -602,9 +605,11 @@ impl FinalisedPMTilesWriter {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     warn!("Failed to write tile data: {:?}", e);
+                    return Err(e);
                 }
                 Err(e) => {
                     warn!("Join error writing tile data: {:?}", e);
+                    return Err(e.into());
                 }
             }
         }
