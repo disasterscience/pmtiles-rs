@@ -35,22 +35,22 @@ impl Tile {
         })
     }
 
-    pub fn new_only_hash_small(tile_id: u64, hash: u64, backend: TileBackend) -> Result<Self> {
-        let len = backend.len()?;
+    // pub fn new_only_hash_small(tile_id: u64, hash: u64, backend: TileBackend) -> Result<Self> {
+    //     let len = backend.len()?;
 
-        let hash = if len.lt(&100_000) {
-            backend.calculate_hash()?
-        } else {
-            hash
-        };
+    //     let hash = if len.lt(&100_000) {
+    //         backend.calculate_hash()?
+    //     } else {
+    //         hash
+    //     };
 
-        Ok(Self {
-            backend,
-            tile_id,
-            hash,
-            len,
-        })
-    }
+    //     Ok(Self {
+    //         backend,
+    //         tile_id,
+    //         hash,
+    //         len,
+    //     })
+    // }
 
     pub async fn read_payload(&self) -> Result<Vec<u8>> {
         match &self.backend {

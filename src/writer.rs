@@ -4,6 +4,7 @@ use crate::{
     Directory, Entry,
 };
 use anyhow::Result;
+use futures::{stream::FuturesUnordered, StreamExt};
 use std::{
     collections::{HashMap, HashSet},
     io::{Seek, SeekFrom, Write},
@@ -15,8 +16,9 @@ use walkdir::WalkDir;
 use serde_json::{json, Value};
 use tokio::{
     fs::File,
-    io::{AsyncSeekExt, AsyncWriteExt, BufWriter},
-    sync::mpsc,
+    io::{AsyncSeekExt, AsyncWriteExt},
+    sync::{mpsc, Mutex},
+    task::JoinHandle,
 };
 
 use crate::{
@@ -106,6 +108,8 @@ impl PMTilesWriter {
     /// # Errors
     /// Returns an error if the directory cannot be read or the files cannot be loaded.
     ///
+    /// # Panics
+    /// Will panic if an expected internal fails, like queueing a tile to be sent.
     #[allow(clippy::cognitive_complexity)]
     pub async fn add_tiles_from_folder(
         mut self,
@@ -353,6 +357,18 @@ pub struct FinalisedPMTilesWriter {
 }
 
 impl FinalisedPMTilesWriter {
+    /// Write the `PMTiles` archive to a file.
+    ///
+    /// # Errors
+    /// Returns an error if the file cannot be created or the `PMTiles` archive cannot be written.
+    pub async fn write_to_file(self, path: PathBuf) -> Result<()> {
+        trace!("Writing PMTiles to file: {:?}", &path);
+
+        self.write(&path).await?;
+
+        Ok(())
+    }
+
     /// Writes the archive to a writer.
     ///
     /// # Errors
@@ -361,9 +377,15 @@ impl FinalisedPMTilesWriter {
     pub async fn write(
         mut self,
         // output: &mut (impl AsyncWrite + Send + Unpin + AsyncSeekExt),
-        mut output: File,
+        path: &Path,
     ) -> Result<()> {
+        // Delete the file if it already exists
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+
         trace!("Writing PMTiles archive");
+        let mut output = File::create(path).await?;
 
         // ROOT DIR
         output
@@ -458,6 +480,8 @@ impl FinalisedPMTilesWriter {
         //         output.write_all(&content).await?;
         //     }
         // }
+        output.flush().await?;
+
         Self::vector_tile_write(self.tiles, tile_data_offset, output).await?;
 
         Ok(())
@@ -469,22 +493,16 @@ impl FinalisedPMTilesWriter {
         // output: &mut (impl AsyncWrite + Send + Unpin + AsyncSeekExt),
         file: File,
     ) -> Result<()> {
-        let (tx, mut rx) = mpsc::channel::<(Vec<u8>, u64)>(2048);
-
-        let mut output: std::fs::File = file.into_std().await;
-
-        // let mut output = BufWriter::with_capacity(500 * 1024, file);
-
-        // Determine total size of all tiles
-        let data_size: u64 = tiles.iter().map(|t| u64::from(t.len)).sum();
-        let total_size: u64 = data_offset + data_size;
-
-        trace!("Pre-allocating entire output: {}", total_size);
+        let mut output = file.try_into_std().expect("cannot convert file");
 
         // Pre-allocate space for all tiles, early error rather than half way through processing
+        let data_size: u64 = tiles.iter().map(|t| u64::from(t.len)).sum();
+        let total_size: u64 = data_offset + data_size;
+        trace!("Pre-allocating entire output: {}", total_size);
         output.seek(SeekFrom::Start(data_offset))?;
         output.write_all(&vec![0; usize::try_from(data_size)?])?;
 
+        // Calculate the offsets for each tile
         let tile_offsets: Vec<u64> = tiles
             .iter()
             .scan(data_offset, |acc, tile| {
@@ -494,42 +512,102 @@ impl FinalisedPMTilesWriter {
             })
             .collect();
 
-        // Read the tile data and send it to the writer, so ideally reads > writes
-        tokio::spawn(async move {
-            // Calculate where the tiles will be written
+        // Merge the offsets with the tiles
+        let tile_with_offset = tiles
+            .into_iter()
+            .zip(tile_offsets)
+            .collect::<Vec<(Tile, u64)>>();
 
-            for (tile, offset) in tiles.into_iter().zip(tile_offsets) {
-                if let Ok(tile_payload) = tile.read_payload().await {
-                    if let Err(e) = tx.send((tile_payload, offset)).await {
-                        warn!("Failed to send tile data: {:?}", e);
-                    }
-                }
+        // Sort by offset, so we can roughly write in order
+        // tile_with_offset.sort_by_key(|(_, offset)| *offset);
+
+        // // Read the tile data and send it to the writer, so ideally reads > writes
+        // tokio::spawn(async move {
+        //     // Calculate where the tiles will be written
+
+        //     for (tile, offset) in tile_with_offset {
+        //         if let Ok(tile_payload) = tile.read_payload().await {
+        //             if let Err(e) = tx.send((tile_payload, offset)).await {
+        //                 warn!("Failed to send tile data: {:?}", e);
+        //             }
+        //         }
+        //     }
+        // });
+
+        // // Consume the tile data and write it to the output
+        // let mut count = 0;
+        // while let Some((payload, offset)) = rx.recv().await {
+        //     if count % 1000 == 0 {
+        //         debug!("Writing tile data: {}, offset: {}", count, offset,);
+        //     }
+        //     output.seek(SeekFrom::Start(offset)).await?;
+        //     output.write_all(&payload).await?;
+        //     output.flush().await?;
+        //     count += 1;
+        // }
+
+        // trace!("Wrote {} tiles", count);
+
+        // Ok(())
+
+        // Multi writer implementation.
+        // Ensure the writers have enough work to do by fanning out the work
+        let mut tasks: FuturesUnordered<JoinHandle<Result<()>>> = FuturesUnordered::new();
+        let (tx, rx) = crossbeam_channel::bounded::<(Tile, u64)>(256);
+
+        // Enqueue the tiles
+        tasks.push(tokio::spawn(async move {
+            for (tile, offset) in tile_with_offset {
+                tx.send((tile, offset))?;
             }
-        });
 
-        // Consume the tile data and write it to the output
-        let mut count = 0;
-        while let Some((payload, offset)) = rx.recv().await {
-            output.seek(SeekFrom::Start(offset))?;
-            output.write_all(&payload)?;
-            output.flush()?;
-            count += 1;
+            Ok(())
+        }));
+
+        let output = std::sync::Arc::new(Mutex::new(output));
+
+        // Create some writer workers
+        for worker in 0..16 {
+            let rx = rx.clone();
+
+            // Open our own handle
+            let output = output.clone();
+
+            // Spawn the worker
+            tasks.push(tokio::spawn(async move {
+                let mut task_count = 0;
+                while let Ok((tile, offset)) = rx.recv() {
+                    if task_count % 1000 == 0 {
+                        trace!(
+                            "Worker: {}, writing tile data: {}, queue: {}",
+                            worker,
+                            task_count,
+                            rx.len()
+                        );
+                    }
+                    let payload = tile.read_payload().await?;
+                    let mut output = output.lock().await;
+                    output.seek(SeekFrom::Start(offset))?;
+                    output.write_all(&payload)?;
+                    output.flush()?;
+                    task_count += 1;
+                }
+                Ok(())
+            }));
         }
 
-        trace!("Wrote {} tiles", count);
-
-        Ok(())
-    }
-
-    /// Write the `PMTiles` archive to a file.
-    ///
-    /// # Errors
-    /// Returns an error if the file cannot be created or the `PMTiles` archive cannot be written.
-    pub async fn write_to_file(self, path: PathBuf) -> Result<()> {
-        trace!("Writing PMTiles to file: {:?}", &path);
-        let file = File::create(path).await?;
-        self.write(file).await?;
-
+        // Wait for tasks
+        while let Some(finished_task) = tasks.next().await {
+            match finished_task {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!("Failed to write tile data: {:?}", e);
+                }
+                Err(e) => {
+                    warn!("Join error writing tile data: {:?}", e);
+                }
+            }
+        }
         Ok(())
     }
 }
