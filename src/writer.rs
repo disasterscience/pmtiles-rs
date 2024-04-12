@@ -77,7 +77,7 @@ impl PMTilesWriter {
     /// Can error if the read failed or the tile data was not compressed.
     pub fn add_tile(&mut self, tile_id: u64, tile_data: impl Into<TileBackend>) -> Result<()> {
         // Ensure the tile doesn't already exist
-        self.remove_tile(tile_id);
+        // self.remove_tile(tile_id);
 
         // Create a tile
         let tile = Tile::new(tile_id, tile_data.into())?;
@@ -87,7 +87,31 @@ impl PMTilesWriter {
         Ok(())
     }
 
+    /// Adds a tile to this `PMTiles` archive, from xyz coordinates.
+    ///
+    /// Note that the data should already be compressed if [`Self::tile_compression`] is set to a value other than [`Compression::None`].
+    /// The data will **NOT** be compressed automatically.
+    /// The [`util`-module](crate::util) includes utilities to compress data.
+    ///
+    /// # Errors
+    /// Can error if the read failed or the tile data was not compressed.
+    pub fn add_tile_xyz(
+        &mut self,
+        z: u8,
+        x: u64,
+        y: u64,
+        tile_data: impl Into<TileBackend>,
+    ) -> Result<()> {
+        let tile_id = tile_id(z, x, y);
+        self.add_tile(tile_id, tile_data)
+    }
+
     pub fn add(&mut self, tile: Tile) {
+        // Check if the tile exists already
+        // if self.tile_id_to_hash.contains_key(&tile.tile_id) {
+        //     return;
+        // }
+
         // Allow the tile to be found by its ID
         self.tile_id_to_hash.insert(tile.tile_id, tile.hash);
 
