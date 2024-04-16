@@ -1,7 +1,9 @@
 use ahash::RandomState;
 use anyhow::Result;
+use bytes::{Bytes, BytesMut};
 use deku::{bitvec::BitView, DekuRead};
 use std::{collections::HashMap, io::SeekFrom, sync::Arc};
+use tracing::debug;
 
 use serde_json::Value;
 use tokio::{
@@ -11,13 +13,13 @@ use tokio::{
 
 use crate::{
     header::HEADER_BYTES,
-    util::{decompress_async, read_dir_rec_async, OffsetLength},
+    util::{decompress_async, read_dir_rec_async, tile_id, OffsetLength},
     Compression, Header,
 };
 
 #[allow(clippy::module_name_repetitions)]
 pub struct PMTilesReader<R> {
-    _reader: Arc<RwLock<BufReader<R>>>,
+    reader: Arc<RwLock<BufReader<R>>>,
     pub header: Header,
     pub metadata: Option<Value>,
     pub tiles: HashMap<u64, OffsetLength, RandomState>,
@@ -25,7 +27,7 @@ pub struct PMTilesReader<R> {
 
 impl<R> PMTilesReader<R>
 where
-    R: AsyncRead + AsyncSeek + Send + Sync + Unpin,
+    R: AsyncRead + AsyncSeek + Send + Unpin,
 {
     /// Create a new `PMTilesReader` from a reader
     ///
@@ -86,7 +88,7 @@ where
         let reader = Arc::new(RwLock::new(buf_reader));
 
         Ok(Self {
-            _reader: reader,
+            reader,
             header: pmtiles_header,
             metadata,
             tiles,
@@ -95,6 +97,41 @@ where
 
     pub fn num_tiles(&self) -> usize {
         self.tiles.len()
+    }
+
+    /// Recursively locates a tile in the archive.
+    fn find_tile_entry(&self, tile_id: u64) -> Option<OffsetLength> {
+        // if let Some(entry) = self.tiles.get(&tile_id) {
+        //     if entry.is_leaf() {
+        //         return self.find_entry_rec(tile_id, entry, 0).await;
+        //     }
+        // }
+        // entry.cloned()
+
+        self.tiles.get(&tile_id).copied()
+    }
+
+    /// Fetches tile bytes from the archive.
+    pub async fn get_tile(&self, z: u8, x: u64, y: u64) -> Option<Bytes> {
+        let tile_id = tile_id(z, x, y);
+        let entry = self.find_tile_entry(tile_id)?;
+
+        debug!(
+            "z/x/y: {}/{}/{}, tile_id: {}, entry: {:?}",
+            z, x, y, tile_id, entry
+        );
+
+        let offset = self.header.tile_data_offset + entry.offset;
+        let length = entry.length;
+
+        let mut buf: Vec<u8> = vec![0; length.try_into().unwrap_or(0)];
+        let mut reader = self.reader.write().await;
+
+        reader.seek(SeekFrom::Start(offset)).await.ok()?;
+        reader.read_exact(&mut buf).await.ok()?;
+        drop(reader);
+
+        Some(Bytes::from(buf))
     }
 }
 
