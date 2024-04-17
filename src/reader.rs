@@ -1,6 +1,6 @@
 use ahash::RandomState;
 use anyhow::Result;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use deku::{bitvec::BitView, DekuRead};
 use std::{collections::HashMap, io::SeekFrom, sync::Arc};
 use tracing::debug;
@@ -18,8 +18,9 @@ use crate::{
 };
 
 #[allow(clippy::module_name_repetitions)]
-pub struct PMTilesReader<R> {
-    reader: Arc<RwLock<BufReader<R>>>,
+#[derive(Clone)]
+pub struct PMTilesReader<R: AsyncRead + AsyncSeek + Send + Unpin + Sync> {
+    reader: Arc<RwLock<R>>,
     pub header: Header,
     pub metadata: Option<Value>,
     pub tiles: HashMap<u64, OffsetLength, RandomState>,
@@ -27,18 +28,18 @@ pub struct PMTilesReader<R> {
 
 impl<R> PMTilesReader<R>
 where
-    R: AsyncRead + AsyncSeek + Send + Unpin,
+    R: AsyncRead + AsyncSeek + Send + Unpin + Sync,
 {
     /// Create a new `PMTilesReader` from a reader
     ///
     /// # Errors
     /// Will return an error if the reader is not valid `PMTiles`.
-    pub async fn new(reader: R) -> Result<Self> {
-        let mut buf_reader = BufReader::new(reader);
-
+    pub async fn new(mut reader: R) -> Result<Self> {
         // The header always needs to be parsed
         let mut header_chunk = [0; HEADER_BYTES as usize];
-        buf_reader.read_exact(&mut header_chunk).await?;
+        reader.seek(SeekFrom::Start(0)).await?;
+        reader.read_exact(&mut header_chunk).await?;
+
         let (_, pmtiles_header) = Header::read(header_chunk.to_vec().view_bits(), ())?;
 
         // Load metadata
@@ -47,7 +48,7 @@ where
         } else {
             {
                 // Seek to metadata offset
-                buf_reader
+                reader
                     .seek(SeekFrom::Start(pmtiles_header.json_metadata_offset))
                     .await?;
 
@@ -56,7 +57,7 @@ where
                     vec![0u8; usize::try_from(pmtiles_header.json_metadata_length)?];
 
                 // Read into buffer
-                buf_reader.read_exact(&mut metadata_bytes).await?;
+                reader.read_exact(&mut metadata_bytes).await?;
 
                 // Create as a buffer
                 let metadata_reader = BufReader::new(metadata_bytes.as_slice());
@@ -73,7 +74,7 @@ where
         let mut tiles = HashMap::<u64, OffsetLength, RandomState>::default();
 
         read_dir_rec_async(
-            &mut buf_reader,
+            &mut reader,
             &mut tiles,
             pmtiles_header.internal_compression,
             (
@@ -84,11 +85,9 @@ where
             &(..),
         )
         .await?;
-
-        let reader = Arc::new(RwLock::new(buf_reader));
-
+    
         Ok(Self {
-            reader,
+            reader: Arc::new(RwLock::new(reader)),
             header: pmtiles_header,
             metadata,
             tiles,
@@ -125,8 +124,8 @@ where
         let length = entry.length;
 
         let mut buf: Vec<u8> = vec![0; length.try_into().unwrap_or(0)];
-        let mut reader = self.reader.write().await;
 
+        let mut reader = self.reader.write().await;
         reader.seek(SeekFrom::Start(offset)).await.ok()?;
         reader.read_exact(&mut buf).await.ok()?;
         drop(reader);
