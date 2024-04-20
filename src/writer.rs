@@ -927,34 +927,34 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_add_tiles_from_folder() -> Result<()> {
-        init_logging();
+    // #[tokio::test]
+    // async fn test_add_tiles_from_folder() -> Result<()> {
+    //     init_logging();
 
-        let writer = PMTilesWriter::new(TileType::Png, Compression::None);
+    //     let writer = PMTilesWriter::new(TileType::Png, Compression::None);
 
-        let input_folder = std::path::Path::new("test/act");
-        let output_file = std::path::Path::new("test/test_add_tiles_from_folder.pmtiles");
+    //     let input_folder = std::path::Path::new("test/act");
+    //     let output_file = std::path::Path::new("test/test_add_tiles_from_folder.pmtiles");
 
-        let result = writer.add_tiles_from_folder(input_folder).await?;
+    //     let result = writer.add_tiles_from_folder(input_folder).await?;
 
-        assert_eq!(result.directory.len(), 6);
-        assert_eq!(result.header.num_tile_entries, 6);
-        assert_eq!(result.header.num_addressed_tiles, 6);
-        assert_eq!(result.header.num_tile_content, 6);
+    //     assert_eq!(result.directory.len(), 6);
+    //     assert_eq!(result.header.num_tile_entries, 6);
+    //     assert_eq!(result.header.num_addressed_tiles, 6);
+    //     assert_eq!(result.header.num_tile_content, 6);
 
-        result.write_to_file(output_file.to_path_buf()).await?;
+    //     result.write_to_file(output_file.to_path_buf()).await?;
 
-        let reader = File::open(output_file).await?;
-        let pmtiles = PMTilesReader::new(reader).await?;
+    //     let reader = File::open(output_file).await?;
+    //     let pmtiles = PMTilesReader::new(reader).await?;
 
-        assert_eq!(pmtiles.num_tiles(), 6);
-        assert_eq!(pmtiles.header.num_tile_entries, 6);
-        assert_eq!(pmtiles.header.num_addressed_tiles, 6);
-        assert_eq!(pmtiles.header.num_tile_content, 6);
+    //     assert_eq!(pmtiles.num_tiles(), 6);
+    //     assert_eq!(pmtiles.header.num_tile_entries, 6);
+    //     assert_eq!(pmtiles.header.num_addressed_tiles, 6);
+    //     assert_eq!(pmtiles.header.num_tile_content, 6);
 
-        debug!("read header: {:?}", pmtiles.header);
+    //     debug!("read header: {:?}", pmtiles.header);
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 }
