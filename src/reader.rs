@@ -3,7 +3,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use deku::{bitvec::BitView, DekuRead};
 use std::{collections::HashMap, io::SeekFrom, sync::Arc};
-use tracing::debug;
+use tracing::trace;
 
 use serde_json::Value;
 use tokio::{
@@ -119,39 +119,48 @@ where
     }
 
     /// Fetches tile bytes from the archive.
-    pub async fn get_tile(&self, z: u8, x: u64, y: u64) -> Option<Bytes> {
+    ///
+    /// # Errors
+    /// Will return an error if the tile is not found.
+    ///
+    pub async fn get_tile(&self, z: u8, x: u64, y: u64) -> Result<Option<Bytes>> {
         let tile_id = tile_id(z, x, y);
-        let entry = self.find_tile_entry(tile_id)?;
+        if let Some(entry) = self.find_tile_entry(tile_id) {
+            trace!(
+                "z/x/y: {}/{}/{}, tile_id: {}, entry: {:?}",
+                z,
+                x,
+                y,
+                tile_id,
+                entry
+            );
 
-        debug!(
-            "z/x/y: {}/{}/{}, tile_id: {}, entry: {:?}",
-            z, x, y, tile_id, entry
-        );
+            let offset = self.header.tile_data_offset + entry.offset;
+            let length = entry.length;
 
-        let offset = self.header.tile_data_offset + entry.offset;
-        let length = entry.length;
+            let mut buf: Vec<u8> = vec![0; length.try_into().unwrap_or(0)];
 
-        let mut buf: Vec<u8> = vec![0; length.try_into().unwrap_or(0)];
+            // Prefer using a reader that just goes to an offset and gets bytes
+            if let Some(sane_reader) = &self.tile_reader {
+                let bytes = sane_reader
+                    .get_bytes_at_offset(
+                        length.try_into().unwrap_or_default(),
+                        offset.try_into().unwrap_or_default(),
+                    )
+                    .await?;
 
-        // Prefer using a reader that just goes to an offset and gets bytes
-        if let Some(sane_reader) = &self.tile_reader {
-            let bytes = sane_reader
-                .get_bytes_at_offset(
-                    length.try_into().unwrap_or_default(),
-                    offset.try_into().unwrap_or_default(),
-                )
-                .await
-                .ok();
+                return Ok(Some(bytes));
+            }
 
-            return bytes;
+            let mut reader = self.reader.write().await;
+            reader.seek(SeekFrom::Start(offset)).await?;
+            reader.read_exact(&mut buf).await?;
+            drop(reader);
+
+            Ok(Some(Bytes::from(buf)))
+        } else {
+            Ok(None)
         }
-
-        let mut reader = self.reader.write().await;
-        reader.seek(SeekFrom::Start(offset)).await.ok()?;
-        reader.read_exact(&mut buf).await.ok()?;
-        drop(reader);
-
-        Some(Bytes::from(buf))
     }
 }
 
@@ -200,7 +209,7 @@ where
         let mut reader = self.reader.write().await;
 
         reader
-            .seek(SeekFrom::Start(offset.try_into().unwrap()))
+            .seek(SeekFrom::Start(offset.try_into().unwrap_or_default()))
             .await?;
 
         let mut buf = vec![0; length];
