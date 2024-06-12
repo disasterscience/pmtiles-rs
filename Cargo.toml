@@ -41,7 +41,7 @@ tokio = { version = "1.27.0", features = ["fs", "sync", "io-util"] }
 anyhow = "1.0.81"
 thiserror = "1.0.58"
 blake3 = { version = "1.5.1", features = ["rayon", "mmap"] }
-async-trait = "0.1.79"
+async-trait = "0.1.80"
 walkdir = "2.5.0"
 crossbeam-channel = "0.5.12"
 futures = { version = "0.3.30", default-features = false }
