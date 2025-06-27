@@ -4,7 +4,7 @@ use crate::{
     Directory, Entry,
 };
 use anyhow::Result;
-use futures::{stream::FuturesUnordered, StreamExt};
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use std::{
     collections::{HashMap, HashSet},
     io::{SeekFrom, Write},
@@ -645,11 +645,10 @@ impl FinalisedPMTilesWriter {
 mod test {
 
     use anyhow::Result;
-    use tokio::fs::File;
     use tracing::debug;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-    use crate::{Compression, PMTilesReader, PMTilesWriter, TileType};
+    use crate::{Compression, PMTilesWriter, TileType};
 
     fn init_logging() {
         let _ = tracing_subscriber::registry()
